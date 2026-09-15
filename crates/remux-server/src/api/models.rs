@@ -1108,33 +1108,76 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         item.can_download = Some(false);
         item.lock_data = Some(false);
         item.is_place_holder = Some(false);
+
         // Channels use direct-play passthrough — no GStreamer probe needed.
-        item.media_sources = Some(vec![MediaSourceInfo {
-            id: media.id,
-            e_tag: media.id,
-            name: Some(
-                media
-                    .title
-                    .clone(),
-            ),
-            path: media
-                .stream_info
-                .as_ref()
-                .and_then(|si| {
-                    si.descriptor
-                        .as_http_url()
-                        .map(str::to_owned)
-                }),
-            protocol: MediaProtocol::Http,
-            is_remote: true,
-            is_infinite_stream: true,
-            supports_direct_play: true,
-            supports_direct_stream: true,
-            supports_transcoding: true,
-            type_: MediaSourceType::Placeholder,
-            video_type: VideoType::VideoFile,
-            ..Default::default()
-        }]);
+        // Unlike Movie/Episode, a channel's versions are not dynamically
+        // resolved per-request: whatever `Stream`-kind child rows an addon
+        // synced (in `idx` order, via the same `media.sources`/`.streams()`
+        // mechanism Movie/Episode use) are shown as-is.
+        fn channel_media_source(source: &db::Media) -> MediaSourceInfo {
+            // A source whose descriptor carries request headers (e.g. the
+            // Dispatcharr addon's X-API-Key) can't be direct-played by the
+            // client — it has no way to attach that header — so route it
+            // through remux's own generic `GET /stream/{id}` proxy instead,
+            // which forwards `request_headers` server-side
+            // (`HttpSource::serve_inner`). Anything with no extra headers
+            // (plain `iptv-m3u` channels) keeps direct-playing the raw URL
+            // unchanged.
+            let needs_proxy = matches!(
+                source.stream_info.as_ref().map(|si| &si.descriptor),
+                Some(crate::stream::StreamDescriptor::Http { request_headers, .. })
+                    if !request_headers.is_empty()
+            );
+            let path = if needs_proxy {
+                Some(format!("/stream/{}", source.id))
+            } else {
+                source
+                    .stream_info
+                    .as_ref()
+                    .and_then(|si| {
+                        si.descriptor
+                            .as_http_url()
+                            .map(str::to_owned)
+                    })
+            };
+            MediaSourceInfo {
+                id: source.id,
+                e_tag: source.id,
+                name: Some(
+                    source
+                        .title
+                        .clone(),
+                ),
+                path,
+                protocol: MediaProtocol::Http,
+                is_remote: true,
+                is_infinite_stream: true,
+                supports_direct_play: true,
+                supports_direct_stream: true,
+                supports_transcoding: true,
+                type_: MediaSourceType::Placeholder,
+                video_type: VideoType::VideoFile,
+                ..Default::default()
+            }
+        }
+
+        item.media_sources = match media
+            .sources
+            .as_deref()
+        {
+            Some(sources) if !sources.is_empty() => {
+                let mut infos: Vec<MediaSourceInfo> = sources
+                    .iter()
+                    .map(channel_media_source)
+                    .collect();
+                // Clients expect the first source's ID to equal the parent
+                // item's ID (same convention as Movie/Episode above).
+                infos[0].id = media.id;
+                infos[0].e_tag = media.id;
+                Some(infos)
+            }
+            _ => Some(vec![channel_media_source(&media)]),
+        };
     }
 
     if media.kind == db::MediaKind::Collection {

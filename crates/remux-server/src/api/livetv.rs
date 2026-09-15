@@ -114,7 +114,7 @@ pub async fn livetv_channels(
     _session: AuthSession,
     Query(q): Query<GetChannelsQuery>,
 ) -> Result<impl IntoResponse> {
-    let result = db::Media::get_by_filter(
+    let mut result = db::Media::get_by_filter(
         &state
             .ctx
             .db,
@@ -128,6 +128,21 @@ pub async fn livetv_channels(
         },
     )
     .await?;
+
+    for channel in result
+        .records
+        .iter_mut()
+    {
+        channel.sources = Some(
+            channel
+                .streams(
+                    &state
+                        .ctx
+                        .db,
+                )
+                .await?,
+        );
+    }
 
     let dtos: Vec<_> = result
         .records
@@ -153,7 +168,7 @@ pub async fn livetv_channel(
     _session: AuthSession,
     Path(channel_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    let media = db::Media::get_by_id(
+    let mut media = db::Media::get_by_id(
         &state
             .ctx
             .db,
@@ -161,6 +176,15 @@ pub async fn livetv_channel(
     )
     .await?
     .context_not_found("channel not found")?;
+    media.sources = Some(
+        media
+            .streams(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await?,
+    );
     Ok(Json(api::db_media_to_item(media, false)))
 }
 
