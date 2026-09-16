@@ -215,6 +215,35 @@ impl StreamService {
         media: db::Media,
     ) -> anyhow::Result<db::Media> {
         match media.kind {
+            db::MediaKind::Recording => {
+                // Same shape as the Movie/Episode/Track branch below minus
+                // the addon dynamic-dispatch refresh: a Recording's single
+                // `Stream` child is synced ahead of time
+                // (`RefreshDispatcharrLiveTvTask`), never resolved
+                // per-request. The row itself carries no `stream_info` —
+                // only its child does — so it can't fall through to the `_`
+                // wildcard below the way TvChannel/TvProgram do.
+                let mut media = media;
+                let media_id = media.id;
+                let sources = media
+                    .streams(&ctx.db)
+                    .await?;
+                let specific_stream =
+                    requested_id.filter(|&sid| sid != item_id && sid != media_id);
+                if let Some(sid) = specific_stream {
+                    sources
+                        .into_iter()
+                        .find(|s| s.id == sid)
+                        .ok_or_else(|| anyhow::anyhow!("stream not found: {}", sid))
+                } else {
+                    sources
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("no playable sources for {}", item_id)
+                        })
+                }
+            }
             db::MediaKind::StreamGroup => {
                 let gid = media.id;
                 let mut candidates =

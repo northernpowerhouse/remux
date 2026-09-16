@@ -221,15 +221,24 @@ impl StreamDescriptor {
     }
 
     /// Input URL/path for ffprobe and ffmpeg (server-side tools).
-    /// `Local` → raw filesystem path. `Http` → URL as-is.
-    /// `Torrent`/`Opendal` → our stream proxy, which resolves them on demand.
+    /// `Local` → raw filesystem path. `Http` → URL as-is, *unless* it
+    /// carries `request_headers`: ffprobe can't attach custom headers, so a
+    /// stream that needs one (e.g. the Dispatcharr addon's `X-API-Key`)
+    /// routes through our own `/stream/{id}` proxy instead — the same
+    /// loopback trick `Torrent`/`Opendal` use — since that proxy does
+    /// forward `request_headers` (`HttpSource::serve_inner`).
     pub fn server_input(&self, media_id: Uuid, port: u16) -> String {
         match self {
-            Self::Http { url, .. } | Self::Rtsp { url } => url.clone(),
+            Self::Http {
+                url,
+                request_headers,
+                ..
+            } if request_headers.is_empty() => url.clone(),
+            Self::Rtsp { url } => url.clone(),
             Self::Local(path) => path
                 .to_string_lossy()
                 .into_owned(),
-            Self::Torrent { .. } | Self::Opendal { .. } => {
+            Self::Http { .. } | Self::Torrent { .. } | Self::Opendal { .. } => {
                 format!("http://127.0.0.1:{}/stream/{}", port, media_id)
             }
         }

@@ -187,6 +187,11 @@ pub enum MediaKind {
     StreamGroup,
     Subtitle,
     Intro,
+    /// A DVR recording (Dispatcharr), finished or still being written.
+    /// Structured exactly like `TvChannel`: this row carries no `stream_info`
+    /// itself, only a synced `Stream`-kind child does — see
+    /// `addons::dispatcharr::recording_stream_to_media`.
+    Recording,
 }
 
 impl MediaKind {
@@ -208,7 +213,11 @@ impl MediaKind {
     pub fn is_playable_leaf(&self) -> bool {
         matches!(
             self,
-            Self::Movie | Self::Episode | Self::Track | Self::TvChannel
+            Self::Movie
+                | Self::Episode
+                | Self::Track
+                | Self::TvChannel
+                | Self::Recording
         )
     }
 }
@@ -298,6 +307,7 @@ impl Into<sdks::remux::MediaKind> for MediaKind {
             MediaKind::StreamGroup => sdks::remux::MediaKind::Stream,
             MediaKind::Subtitle => sdks::remux::MediaKind::Stream,
             MediaKind::Intro => sdks::remux::MediaKind::Stream,
+            MediaKind::Recording => sdks::remux::MediaKind::Stream,
         }
     }
 }
@@ -940,6 +950,11 @@ pub struct ExternalIds {
     pub youtube_id: Option<String>,
     pub iptv_source_id: Option<String>,
     pub iptv_group: Option<String>,
+    /// Dispatcharr's own integer recording id (`MediaKind::Recording` rows
+    /// only) — needed to call back into Dispatcharr's DVR API (delete, or
+    /// fetch the current `file_url` for playback) since a `Uuid::new_v5`
+    /// hash isn't reversible.
+    pub dispatcharr_recording_id: Option<i64>,
     /// Raw addon-specific ID for content that has no IMDB/TMDB/TVDB equivalent.
     /// Derived from the Stremio `meta.id` when no known provider prefix matches.
     pub custom_stremio_id: Option<String>,
@@ -6403,6 +6418,70 @@ impl Media {
             .as_deref()
             .unwrap_or_default()
             .to_vec())
+    }
+
+    /// Batched `streams()` for a list of parents: one query for every
+    /// `Stream`-kind child across all of them, grouped back by `parent_id`,
+    /// instead of one query per parent.
+    pub async fn attach_streams(
+        db: &sqlx::SqlitePool,
+        parents: &mut [Media],
+    ) -> Result<()> {
+        let parent_ids: Vec<Uuid> = parents
+            .iter()
+            .filter(|m| {
+                m.sources
+                    .is_none()
+            })
+            .map(|m| m.id)
+            .collect();
+        if parent_ids.is_empty() {
+            return Ok(());
+        }
+
+        let mut sources = Self::get_by_filter(
+            db,
+            &MediaFilter {
+                kind: Some(vec![MediaKind::Stream]),
+                parent_ids: Some(parent_ids),
+                ..Default::default()
+            },
+        )
+        .await?
+        .records;
+        sources.sort_by(|a, b| {
+            a.idx
+                .cmp(&b.idx)
+        });
+
+        let mut by_parent: HashMap<Uuid, Vec<Media>> = HashMap::new();
+        for source in sources {
+            if let Some(parent_id) = source.parent_id {
+                by_parent
+                    .entry(parent_id)
+                    .or_default()
+                    .push(source);
+            }
+        }
+
+        for parent in parents.iter_mut() {
+            if parent
+                .sources
+                .is_some()
+            {
+                continue;
+            }
+            let mut own = by_parent
+                .remove(&parent.id)
+                .unwrap_or_default();
+            // Same freshness rule as `streams()`: exclude sources that
+            // predate the last refresh.
+            if let Some(refreshed) = parent.streams_refreshed_at {
+                own.retain(|s| s.updated_at >= refreshed);
+            }
+            parent.sources = Some(own);
+        }
+        Ok(())
     }
 
     pub async fn seasons(&mut self, db: &sqlx::SqlitePool) -> Result<Vec<Media>> {

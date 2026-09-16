@@ -23,8 +23,7 @@ use crate::{
 ///   same deterministically-id'd rows if it runs — harmless, idempotent.)
 ///   This has to happen before the two steps below, which insert children
 ///   referencing these rows by `parent_id` — a SQLite foreign-key violation
-///   otherwise (confirmed live: the first version of this task assumed the
-///   channel rows already existed and failed on exactly this).
+///   otherwise.
 /// - **Channel versions**: `import_catalog_items` only persists top-level
 ///   content kinds and drops `Stream`-kind children, so versions have to be
 ///   attached through the same direct `db::Media::upsert` +
@@ -33,8 +32,8 @@ use crate::{
 ///   per-request dynamic dispatch.
 /// - **EPG**: the generic per-addon EPG loop expects an unauthenticated XMLTV
 ///   URL (`config["epg_url"]`). Dispatcharr's `/api/*` endpoints all require
-///   an `X-API-Key` header (confirmed live — everything 401s without one),
-///   and its *unauthenticated* `/output/epg` XMLTV export uses a re-numbered
+///   an `X-API-Key` header (everything 401s without one), and its
+///   *unauthenticated* `/output/epg` XMLTV export uses a re-numbered
 ///   export-local `<channel id>` that does not correspond to any `tvg_id` on
 ///   our channel rows. So EPG is pulled from the authenticated
 ///   `/api/epg/grid/` JSON endpoint instead, matched via each channel's
@@ -173,8 +172,7 @@ impl Task for RefreshDispatcharrLiveTvTask {
             // Multiple channels can legitimately share one `tvg_id` (e.g. SD/HD
             // variants pointing at the same guide source) — each needs its own
             // program rows, so this maps to *all* matching channels, not just
-            // the last one seen (confirmed live: 113 of 981 EPG-assigned
-            // channels shared a `tvg_id` with another channel).
+            // the last one seen.
             let mut tvg_map: HashMap<String, Vec<uuid::Uuid>> = HashMap::new();
 
             for ch in &channels {
@@ -273,6 +271,26 @@ impl Task for RefreshDispatcharrLiveTvTask {
                         versions = all_sources.len(),
                         "Dispatcharr channel versions synced"
                     );
+                }
+            }
+
+            // Recordings sync is independent of EPG mapping (unlike programs
+            // below), so it always runs — a recording that started before
+            // its channel had any guide data assigned shouldn't disappear.
+            // `sync_recordings` also runs on every `/livetv/recordings` read
+            // (`DvrService::list_recordings`), since this task's own
+            // schedule is too infrequent to keep that endpoint current.
+            let dvr_cfg = crate::services::dvr_service::DvrConfig {
+                addon_id,
+                base_url: base_url.clone(),
+                api_key: token.clone(),
+            };
+            match crate::services::DvrService::sync_recordings(&ctx, &dvr_cfg).await {
+                Ok(count) => {
+                    info!(addon = %addon_id, recordings = count, "Dispatcharr recordings synced");
+                }
+                Err(e) => {
+                    warn!(addon = %addon_id, error = %e, "failed to sync Dispatcharr recordings");
                 }
             }
 

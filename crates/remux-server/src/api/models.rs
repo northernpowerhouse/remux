@@ -172,6 +172,7 @@ impl Into<MediaType> for db::MediaKind {
             db::MediaKind::Stream | db::MediaKind::StreamGroup => MediaType::Video,
             db::MediaKind::Subtitle => MediaType::Video,
             db::MediaKind::Intro => MediaType::Video,
+            db::MediaKind::Recording => MediaType::Recording,
         }
     }
 }
@@ -319,8 +320,57 @@ fn stub_sources(media: &db::Media) -> Vec<MediaSourceInfo> {
     ]
 }
 
+/// Shared by `TvChannel` and `Recording`: both are proxied-HTTP content
+/// whose versions come from synced `Stream`-kind children, not per-request
+/// dynamic dispatch or GStreamer probing.
+///
+/// A source whose descriptor carries request headers (e.g. the Dispatcharr
+/// addon's X-API-Key) can't be direct-played by the client — it has no way
+/// to attach that header — so route it through remux's own generic
+/// `GET /stream/{id}` proxy instead, which forwards `request_headers`
+/// server-side (`HttpSource::serve_inner`). Anything with no extra headers
+/// (plain `iptv-m3u` channels) keeps direct-playing the raw URL unchanged.
+fn proxied_media_source(source: &db::Media) -> MediaSourceInfo {
+    let needs_proxy = matches!(
+        source.stream_info.as_ref().map(|si| &si.descriptor),
+        Some(crate::stream::StreamDescriptor::Http { request_headers, .. })
+            if !request_headers.is_empty()
+    );
+    let path = if needs_proxy {
+        Some(format!("/stream/{}", source.id))
+    } else {
+        source
+            .stream_info
+            .as_ref()
+            .and_then(|si| {
+                si.descriptor
+                    .as_http_url()
+                    .map(str::to_owned)
+            })
+    };
+    MediaSourceInfo {
+        id: source.id,
+        e_tag: source.id,
+        name: Some(
+            source
+                .title
+                .clone(),
+        ),
+        path,
+        protocol: MediaProtocol::Http,
+        is_remote: true,
+        is_infinite_stream: true,
+        supports_direct_play: true,
+        supports_direct_stream: true,
+        supports_transcoding: true,
+        type_: MediaSourceType::Placeholder,
+        video_type: VideoType::VideoFile,
+        ..Default::default()
+    }
+}
+
 pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
-    use crate::common::{IntoVec, ToRunTimeTicks};
+    use crate::common::{IntoVec, TickUnit, ToRunTimeTicks};
 
     let type_ = media
         .kind
@@ -398,7 +448,8 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             | db::MediaKind::Episode
             | db::MediaKind::TvChannel
             | db::MediaKind::TvProgram
-            | db::MediaKind::Intro => MediaType::Video,
+            | db::MediaKind::Intro
+            | db::MediaKind::Recording => MediaType::Video,
             db::MediaKind::Track => MediaType::Audio,
             db::MediaKind::Playlist => match media.collection_media_kind {
                 Some(db::CollectionMediaKind::Music) => MediaType::Audio,
@@ -1114,53 +1165,6 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         // resolved per-request: whatever `Stream`-kind child rows an addon
         // synced (in `idx` order, via the same `media.sources`/`.streams()`
         // mechanism Movie/Episode use) are shown as-is.
-        fn channel_media_source(source: &db::Media) -> MediaSourceInfo {
-            // A source whose descriptor carries request headers (e.g. the
-            // Dispatcharr addon's X-API-Key) can't be direct-played by the
-            // client — it has no way to attach that header — so route it
-            // through remux's own generic `GET /stream/{id}` proxy instead,
-            // which forwards `request_headers` server-side
-            // (`HttpSource::serve_inner`). Anything with no extra headers
-            // (plain `iptv-m3u` channels) keeps direct-playing the raw URL
-            // unchanged.
-            let needs_proxy = matches!(
-                source.stream_info.as_ref().map(|si| &si.descriptor),
-                Some(crate::stream::StreamDescriptor::Http { request_headers, .. })
-                    if !request_headers.is_empty()
-            );
-            let path = if needs_proxy {
-                Some(format!("/stream/{}", source.id))
-            } else {
-                source
-                    .stream_info
-                    .as_ref()
-                    .and_then(|si| {
-                        si.descriptor
-                            .as_http_url()
-                            .map(str::to_owned)
-                    })
-            };
-            MediaSourceInfo {
-                id: source.id,
-                e_tag: source.id,
-                name: Some(
-                    source
-                        .title
-                        .clone(),
-                ),
-                path,
-                protocol: MediaProtocol::Http,
-                is_remote: true,
-                is_infinite_stream: true,
-                supports_direct_play: true,
-                supports_direct_stream: true,
-                supports_transcoding: true,
-                type_: MediaSourceType::Placeholder,
-                video_type: VideoType::VideoFile,
-                ..Default::default()
-            }
-        }
-
         item.media_sources = match media
             .sources
             .as_deref()
@@ -1168,7 +1172,7 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             Some(sources) if !sources.is_empty() => {
                 let mut infos: Vec<MediaSourceInfo> = sources
                     .iter()
-                    .map(channel_media_source)
+                    .map(proxied_media_source)
                     .collect();
                 // Clients expect the first source's ID to equal the parent
                 // item's ID (same convention as Movie/Episode above).
@@ -1176,8 +1180,51 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 infos[0].e_tag = media.id;
                 Some(infos)
             }
-            _ => Some(vec![channel_media_source(&media)]),
+            _ => Some(vec![proxied_media_source(&media)]),
         };
+    }
+
+    if media.kind == db::MediaKind::Recording {
+        item.location_type = LocationType::Remote;
+        item.can_delete = Some(true);
+        item.can_download = Some(false);
+        item.lock_data = Some(false);
+        item.is_place_holder = Some(false);
+
+        // Same shape as `TvChannel` above: one synced `Stream` child carries
+        // `stream_info`, this row never has its own. Unlike a channel it's a
+        // finite file (`media.runtime` gives its length), and its `Path`
+        // always goes through `/livetv/liverecordings/{id}/stream` rather
+        // than `proxied_media_source`'s `/stream/{id}` proxy, since only
+        // that handler branches on Dispatcharr's file-vs-HLS redirect for a
+        // recording still in progress.
+        let run_time_ticks = media
+            .runtime
+            .and_then(|r| r.to_ticks(TickUnit::Seconds));
+        let recording_id = media.id;
+        let finite = move |mut info: MediaSourceInfo| {
+            info.is_infinite_stream = false;
+            info.run_time_ticks = run_time_ticks;
+            info.path = Some(format!("/livetv/liverecordings/{recording_id}/stream"));
+            info
+        };
+        item.media_sources = match media
+            .sources
+            .as_deref()
+        {
+            Some(sources) if !sources.is_empty() => {
+                let mut infos: Vec<MediaSourceInfo> = sources
+                    .iter()
+                    .map(proxied_media_source)
+                    .map(finite)
+                    .collect();
+                infos[0].id = media.id;
+                infos[0].e_tag = media.id;
+                Some(infos)
+            }
+            _ => Some(vec![finite(proxied_media_source(&media))]),
+        };
+        item.run_time_ticks = run_time_ticks;
     }
 
     if media.kind == db::MediaKind::Collection {

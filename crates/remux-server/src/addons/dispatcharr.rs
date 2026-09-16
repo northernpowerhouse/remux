@@ -136,12 +136,12 @@ pub(crate) struct DispatcharrStream {
 
 /// Fetch every Dispatcharr channel.
 ///
-/// Verified live: called with no query params, this returns a plain JSON
-/// array of *every* channel, not DRF's `{count,next,previous,results}`
-/// envelope — that wrapper only appears when a `page_size` param is
-/// explicitly passed. Same for `/api/epg/epgdata/` (`fetch_epg_data`) and the
-/// per-channel `/streams/` endpoint (`fetch_channel_streams`) — neither
-/// paginates by default either.
+/// Called with no query params, this returns a plain JSON array of *every*
+/// channel, not DRF's `{count,next,previous,results}` envelope — that
+/// wrapper only appears when a `page_size` param is explicitly passed. Same
+/// for `/api/epg/epgdata/` (`fetch_epg_data`) and the per-channel
+/// `/streams/` endpoint (`fetch_channel_streams`) — neither paginates by
+/// default either.
 pub(crate) async fn fetch_channels(
     client: &reqwest::Client,
     base_url: &str,
@@ -189,7 +189,7 @@ pub(crate) struct DispatcharrEpgData {
 /// Fetch every `EPGData` row — the per-source guide-channel bindings a
 /// `Channel.epg_data_id` points at. Unlike `channels`/`streams`, this
 /// endpoint returns a plain JSON array, not a paginated `{count,results}`
-/// envelope (verified live).
+/// envelope.
 pub(crate) async fn fetch_epg_data(
     client: &reqwest::Client,
     base_url: &str,
@@ -310,9 +310,9 @@ pub(crate) fn stream_to_media(
             .name
             .clone(),
     };
-    // No trailing slash — verified live: `/proxy/ts/stream/<id>/` (with a
-    // trailing slash) falls through to Dispatcharr's SPA catch-all and
-    // returns an HTML page, not the stream. Requires its own X-API-Key
+    // No trailing slash: `/proxy/ts/stream/<id>/` (with a trailing slash)
+    // falls through to Dispatcharr's SPA catch-all and returns an HTML page,
+    // not the stream. Requires its own X-API-Key
     // header, which a Jellyfin client can't supply — so this can't be
     // direct-played by the client; it's fetched through remux's own generic
     // `GET /stream/{id}` proxy (`HttpSource::serve_inner`, which forwards
@@ -336,6 +336,93 @@ pub(crate) fn stream_to_media(
         stream_info: Some(crate::stream::StreamInfo {
             descriptor: crate::stream::StreamDescriptor::Http {
                 url: format!("{base_url}/proxy/ts/stream/{playback_id}"),
+                request_headers: std::collections::HashMap::from([(
+                    "X-API-Key".to_string(),
+                    api_key.to_string(),
+                )]),
+                response_headers: Default::default(),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Builds the parent `Recording` row for one Dispatcharr DVR recording —
+/// same shape `channel_to_media` uses for channels. The playable file itself
+/// is a separate `Stream`-kind child (`recording_stream_to_media`), never
+/// this row's own `stream_info`.
+pub(crate) fn recording_to_media(
+    rec: &super::dispatcharr_dvr::DispatcharrRecording,
+    addon_id: Uuid,
+    source_id: &str,
+) -> db::Media {
+    let id = Uuid::new_v5(&addon_id, format!("recording:{}", rec.id).as_bytes());
+    db::Media {
+        id,
+        title: rec
+            .program_title()
+            .unwrap_or("Recording")
+            .to_string(),
+        kind: db::MediaKind::Recording,
+        description: rec
+            .program_description()
+            .map(str::to_owned),
+        live_start: Some(
+            rec.start_time
+                .naive_utc(),
+        ),
+        live_end: Some(
+            rec.end_time
+                .naive_utc(),
+        ),
+        runtime: Some(
+            (rec.end_time - rec.start_time)
+                .num_seconds()
+                .max(0),
+        ),
+        parent_id: Some(Uuid::new_v5(
+            &addon_id,
+            format!("channel:{}", rec.channel).as_bytes(),
+        )),
+        external_ids: db::ExternalIds {
+            iptv_source_id: Some(source_id.to_owned()),
+            dispatcharr_recording_id: Some(rec.id),
+            ..Default::default()
+        },
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+/// The single playable `Stream`-kind child of a synced `Recording` row.
+/// `stream_info` points at Dispatcharr's real `/file/` URL (`X-API-Key`
+/// header attached, same as `stream_to_media` does for channels) — this is
+/// the URL `StreamDescriptor::server_input` hands to the internal ffprobe
+/// pass, which needs a genuinely fetchable absolute address, not the
+/// client-facing `/livetv/liverecordings/{id}/stream` Path set separately
+/// in `api::db_media_to_item`'s `Recording` block.
+pub(crate) fn recording_stream_to_media(
+    rec: &super::dispatcharr_dvr::DispatcharrRecording,
+    recording_media_id: Uuid,
+    base_url: &str,
+    api_key: &str,
+    now: chrono::NaiveDateTime,
+) -> db::Media {
+    db::Media {
+        id: Uuid::new_v5(&recording_media_id, b"stream"),
+        title: rec
+            .program_title()
+            .unwrap_or("Recording")
+            .to_string(),
+        kind: db::MediaKind::Stream,
+        parent_id: Some(recording_media_id),
+        idx: Some(0),
+        created_at: now,
+        updated_at: now,
+        stream_info: Some(crate::stream::StreamInfo {
+            descriptor: crate::stream::StreamDescriptor::Http {
+                url: format!("{base_url}/api/channels/recordings/{}/file/", rec.id),
                 request_headers: std::collections::HashMap::from([(
                     "X-API-Key".to_string(),
                     api_key.to_string(),

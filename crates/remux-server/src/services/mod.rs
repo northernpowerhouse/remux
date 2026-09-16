@@ -1,9 +1,11 @@
+pub mod dvr_service;
 pub mod image;
 pub mod media_tracker;
 pub(crate) mod resolve;
 pub(crate) mod stream_service;
 pub mod stremio;
 
+pub use dvr_service::DvrService;
 pub use resolve::MediaResolveService;
 pub(crate) use resolve::ResolvedItem;
 pub(crate) use stream_service::{
