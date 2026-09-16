@@ -2,6 +2,7 @@ use crate::{OptionExt, ResultExt};
 use axum::{
     Json,
     extract::{Path, State},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use axum_anyhow::ApiResult as Result;
@@ -15,6 +16,11 @@ use uuid::Uuid;
 use crate::{
     AppState, api, db,
     db::auth::{AdminSession, AuthSession},
+    services::{
+        DvrService,
+        dvr_service::{CreateSeriesTimerRequest, CreateTimerRequest},
+    },
+    stream::{HttpSource, StreamSource},
 };
 
 // --------------------------------------------------------------------------
@@ -114,7 +120,7 @@ pub async fn livetv_channels(
     _session: AuthSession,
     Query(q): Query<GetChannelsQuery>,
 ) -> Result<impl IntoResponse> {
-    let result = db::Media::get_by_filter(
+    let mut result = db::Media::get_by_filter(
         &state
             .ctx
             .db,
@@ -126,6 +132,14 @@ pub async fn livetv_channels(
             total_count: true,
             ..Default::default()
         },
+    )
+    .await?;
+
+    db::Media::attach_streams(
+        &state
+            .ctx
+            .db,
+        &mut result.records,
     )
     .await?;
 
@@ -153,7 +167,7 @@ pub async fn livetv_channel(
     _session: AuthSession,
     Path(channel_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    let media = db::Media::get_by_id(
+    let mut media = db::Media::get_by_id(
         &state
             .ctx
             .db,
@@ -161,6 +175,15 @@ pub async fn livetv_channel(
     )
     .await?
     .context_not_found("channel not found")?;
+    media.sources = Some(
+        media
+            .streams(
+                &state
+                    .ctx
+                    .db,
+            )
+            .await?,
+    );
     Ok(Json(api::db_media_to_item(media, false)))
 }
 
@@ -522,12 +545,65 @@ pub async fn livetv_programs_post(
 // --------------------------------------------------------------------------
 
 #[get("/livetv/seriestimers")]
-pub async fn livetv_series_timers(_session: AuthSession) -> Result<impl IntoResponse> {
-    Ok(Json(api::QueryResult::<api::BaseItemDto> {
-        total_record_count: 0,
+pub async fn livetv_series_timers(
+    State(state): State<AppState>,
+    _session: AuthSession,
+) -> Result<impl IntoResponse> {
+    let items = DvrService::list_series_timers(&state.ctx).await?;
+    Ok(Json(api::QueryResult {
+        total_record_count: items.len() as i64,
         start_index: 0,
-        items: vec![],
+        items,
     }))
+}
+
+// --------------------------------------------------------------------------
+// POST /livetv/seriestimers
+// --------------------------------------------------------------------------
+
+#[post("/livetv/seriestimers")]
+pub async fn livetv_create_series_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Json(body): Json<CreateSeriesTimerRequest>,
+) -> Result<impl IntoResponse> {
+    let timer = DvrService::create_series_timer(&state.ctx, body).await?;
+    Ok((StatusCode::OK, Json(timer)))
+}
+
+// --------------------------------------------------------------------------
+// GET /livetv/seriestimers/{timerId}
+// --------------------------------------------------------------------------
+
+#[get("/livetv/seriestimers/{timer_id}")]
+pub async fn livetv_get_series_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Path(timer_id): Path<String>,
+) -> Result<impl IntoResponse> {
+    let items = DvrService::list_series_timers(&state.ctx).await?;
+    let found = items
+        .into_iter()
+        .find(|t| t.id == timer_id)
+        .context_not_found("series timer not found")?;
+    Ok(Json(found))
+}
+
+// --------------------------------------------------------------------------
+// DELETE /livetv/seriestimers/{timerId}
+// --------------------------------------------------------------------------
+
+#[delete("/livetv/seriestimers/{timer_id}")]
+pub async fn livetv_delete_series_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Path(timer_id): Path<String>,
+) -> Result<impl IntoResponse> {
+    if DvrService::delete_series_timer(&state.ctx, &timer_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::NOT_FOUND)
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -535,12 +611,63 @@ pub async fn livetv_series_timers(_session: AuthSession) -> Result<impl IntoResp
 // --------------------------------------------------------------------------
 
 #[get("/livetv/timers")]
-pub async fn livetv_timers(_session: AuthSession) -> Result<impl IntoResponse> {
-    Ok(Json(api::QueryResult::<api::BaseItemDto> {
-        total_record_count: 0,
+pub async fn livetv_timers(
+    State(state): State<AppState>,
+    _session: AuthSession,
+) -> Result<impl IntoResponse> {
+    let items = DvrService::list_timers(&state.ctx).await?;
+    Ok(Json(api::QueryResult {
+        total_record_count: items.len() as i64,
         start_index: 0,
-        items: vec![],
+        items,
     }))
+}
+
+// --------------------------------------------------------------------------
+// POST /livetv/timers
+// --------------------------------------------------------------------------
+
+#[post("/livetv/timers")]
+pub async fn livetv_create_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Json(body): Json<CreateTimerRequest>,
+) -> Result<impl IntoResponse> {
+    let timer = DvrService::create_timer(&state.ctx, body).await?;
+    Ok((StatusCode::OK, Json(timer)))
+}
+
+// --------------------------------------------------------------------------
+// GET /livetv/timers/{timerId}
+// --------------------------------------------------------------------------
+
+#[get("/livetv/timers/{timer_id}")]
+pub async fn livetv_get_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Path(timer_id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    let timer = DvrService::get_timer(&state.ctx, timer_id)
+        .await?
+        .context_not_found("timer not found")?;
+    Ok(Json(timer))
+}
+
+// --------------------------------------------------------------------------
+// DELETE /livetv/timers/{timerId}
+// --------------------------------------------------------------------------
+
+#[delete("/livetv/timers/{timer_id}")]
+pub async fn livetv_delete_timer(
+    State(state): State<AppState>,
+    _session: AuthSession,
+    Path(timer_id): Path<i64>,
+) -> Result<impl IntoResponse> {
+    if DvrService::delete_timer(&state.ctx, timer_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::NOT_FOUND)
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -603,11 +730,15 @@ pub async fn livetv_recording_folders(
 // --------------------------------------------------------------------------
 
 #[get("/livetv/recordings")]
-pub async fn livetv_recordings(_session: AuthSession) -> Result<impl IntoResponse> {
-    Ok(Json(api::QueryResult::<api::BaseItemDto> {
-        total_record_count: 0,
+pub async fn livetv_recordings(
+    State(state): State<AppState>,
+    _session: AuthSession,
+) -> Result<impl IntoResponse> {
+    let items = DvrService::list_recordings(&state.ctx).await?;
+    Ok(Json(api::QueryResult {
+        total_record_count: items.len() as i64,
         start_index: 0,
-        items: vec![],
+        items,
     }))
 }
 
@@ -644,12 +775,30 @@ pub async fn livetv_recording_group(
 
 #[get("/livetv/recordings/series")]
 pub async fn livetv_recordings_series(
+    State(state): State<AppState>,
     _session: AuthSession,
 ) -> Result<impl IntoResponse> {
-    Ok(Json(api::QueryResult::<api::BaseItemDto> {
-        total_record_count: 0,
+    let recordings = DvrService::list_recordings(&state.ctx).await?;
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<api::BaseItemDto> = recordings
+        .into_iter()
+        .filter(|r| {
+            r.name
+                .as_ref()
+                .is_some_and(|n| seen.insert(n.clone()))
+        })
+        .map(|r| api::BaseItemDto {
+            id: Uuid::new_v5(&r.id, b"series"),
+            name: r.name,
+            type_: api::MediaType::Series,
+            is_folder: true,
+            ..Default::default()
+        })
+        .collect();
+    Ok(Json(api::QueryResult {
+        total_record_count: items.len() as i64,
         start_index: 0,
-        items: vec![],
+        items,
     }))
 }
 
@@ -659,30 +808,150 @@ pub async fn livetv_recordings_series(
 
 #[get("/livetv/recordings/{recording_id}")]
 pub async fn livetv_recording(
+    State(state): State<AppState>,
     _session: AuthSession,
-    Path(_recording_id): Path<Uuid>,
+    Path(recording_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    Ok(StatusCode::NOT_FOUND)
+    let item = DvrService::get_recording(&state.ctx, recording_id)
+        .await?
+        .context_not_found("recording not found")?;
+    Ok(Json(item))
 }
 
 #[delete("/livetv/recordings/{recording_id}")]
 pub async fn livetv_delete_recording(
+    State(state): State<AppState>,
     _session: AuthSession,
-    Path(_recording_id): Path<Uuid>,
+    Path(recording_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    Ok(StatusCode::NOT_FOUND)
+    if DvrService::delete_recording(&state.ctx, recording_id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Ok(StatusCode::NOT_FOUND)
+    }
 }
 
 // --------------------------------------------------------------------------
 // GET /livetv/liverecordings/{recordingId}/stream
+//
+// The single playback entry point for a Dispatcharr recording, in progress
+// or finished: `custom_properties.file_url` on the Dispatcharr `Recording`
+// is the authoritative pointer regardless of state (Dispatcharr itself
+// redirects `/file/` to `/hls/index.m3u8` while still recording — see
+// `DispatcharrRecording::file_url`'s doc comment). A client can never hit
+// Dispatcharr directly: recording playback requires the same `X-API-Key`
+// header channel streams do, which only this server can attach.
+//
+// No `AuthSession` here, deliberately, same as `GET /stream/{id}`
+// (`api/stream.rs`) — Uuids are stable but not guessable, and the internal
+// ffprobe pass behind `/items/{id}/playbackinfo` fetches this exact URL
+// with no session to attach.
 // --------------------------------------------------------------------------
 
 #[get("/livetv/liverecordings/{recording_id}/stream")]
 pub async fn livetv_live_recording_stream(
-    _session: AuthSession,
-    Path(_recording_id): Path<Uuid>,
+    State(state): State<AppState>,
+    Path(recording_id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse> {
-    Ok(StatusCode::NOT_FOUND)
+    let Some((cfg, rec)) =
+        DvrService::recording_playback_target(&state.ctx, recording_id).await?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let Some(file_url) = rec.file_url() else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let url = format!("{}{file_url}", cfg.base_url);
+
+    if file_url.contains("/hls/") || file_url.ends_with(".m3u8") {
+        let resp = reqwest::Client::new()
+            .get(&url)
+            .header("X-API-Key", &cfg.api_key)
+            .send()
+            .await
+            .context_bad_request("upstream HLS request failed")?
+            .error_for_status()
+            .context_bad_request("upstream HLS request failed")?
+            .text()
+            .await
+            .context_bad_request("failed reading upstream playlist")?;
+        let rewritten = rewrite_hls_playlist(&resp, recording_id);
+        return Ok((
+            [(http::header::CONTENT_TYPE, "application/vnd.apple.mpegurl")],
+            rewritten,
+        )
+            .into_response());
+    }
+
+    let source = HttpSource {
+        url,
+        request_headers: std::collections::HashMap::from([(
+            "X-API-Key".to_string(),
+            cfg.api_key,
+        )]),
+        response_headers: Default::default(),
+    };
+    Ok(source
+        .serve(&state, &headers)
+        .await?
+        .into_response())
+}
+
+/// Rewrites every non-`#` line of an HLS playlist (segment URIs, which
+/// Dispatcharr itself already rewrote to route through its own `/hls/`
+/// endpoint — see its `RecordingViewSet.hls` docstring) to route through our
+/// own segment proxy instead, since the client can't attach `X-API-Key` to
+/// reach Dispatcharr's directly.
+fn rewrite_hls_playlist(playlist: &str, recording_id: Uuid) -> String {
+    playlist
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                line.to_string()
+            } else {
+                let seg = trimmed
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(trimmed);
+                format!("/livetv/liverecordings/{recording_id}/hls/{seg}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+// --------------------------------------------------------------------------
+// GET /livetv/liverecordings/{recordingId}/hls/{segPath}
+// --------------------------------------------------------------------------
+
+#[get("/livetv/liverecordings/{recording_id}/hls/{seg_path}")]
+pub async fn livetv_recording_hls_segment(
+    State(state): State<AppState>,
+    Path((recording_id, seg_path)): Path<(Uuid, String)>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse> {
+    let Some((cfg, rec)) =
+        DvrService::recording_playback_target(&state.ctx, recording_id).await?
+    else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let source = HttpSource {
+        url: format!(
+            "{}/api/channels/recordings/{}/hls/{seg_path}",
+            cfg.base_url, rec.id
+        ),
+        request_headers: std::collections::HashMap::from([(
+            "X-API-Key".to_string(),
+            cfg.api_key,
+        )]),
+        response_headers: Default::default(),
+    };
+    Ok(source
+        .serve(&state, &headers)
+        .await?
+        .into_response())
 }
 
 // --------------------------------------------------------------------------
