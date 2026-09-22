@@ -2282,6 +2282,62 @@ mod tests {
         }));
     }
 
+    /// `PlaybackInfo` rebuilds each source's `remux` block after probing, so
+    /// it is a second place a provider credential could reach a client.
+    #[tokio::test]
+    async fn test_playbackinfo_never_exposes_provider_request_headers() {
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        // A live upstream, so the cached probe is taken as still valid (the
+        // handler HEADs an HTTP source before reusing its probe).
+        let upstream = httpmock::MockServer::start();
+        upstream.mock(|when, then| {
+            when.any_request();
+            then.status(200);
+        });
+        let mut media = insert_test_source(&guard.0).await;
+        media.stream_info = Some(crate::stream::StreamInfo {
+            descriptor: crate::stream::StreamDescriptor::Http {
+                url: upstream.url("/live"),
+                request_headers: [(
+                    "X-API-Key".to_string(),
+                    "provider-secret-key".to_string(),
+                )]
+                .into(),
+                response_headers: Default::default(),
+            },
+            ..Default::default()
+        });
+        media
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        let resp = server
+            .post(&format!("/items/{}/playbackinfo", media.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({}))
+            .await;
+
+        resp.assert_status_ok();
+        let body = resp.text();
+        assert!(
+            body.contains("ProviderInfo") || body.contains("provider_info"),
+            "the block should still be present, only redacted: {body}"
+        );
+        assert!(
+            !body.contains("provider-secret-key") && !body.contains("X-API-Key"),
+            "credential leaked to the client: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn test_playbackinfo_minimal() {
         let (server, guard, token) = authenticated_server().await;

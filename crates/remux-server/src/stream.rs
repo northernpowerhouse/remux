@@ -384,6 +384,20 @@ pub struct StreamInfo {
 }
 
 impl StreamInfo {
+    /// Copy safe to hand to API clients: `Http` `request_headers` carry
+    /// provider credentials, so they are cleared. Playback reads the full
+    /// descriptor from the DB row.
+    pub fn redacted_for_client(&self) -> Self {
+        let mut info = self.clone();
+        if let StreamDescriptor::Http {
+            request_headers, ..
+        } = &mut info.descriptor
+        {
+            request_headers.clear();
+        }
+        info
+    }
+
     pub fn is_p2p(&self) -> bool {
         matches!(self.descriptor, StreamDescriptor::Torrent { .. })
     }
@@ -894,6 +908,50 @@ mod tests {
         };
         assert_eq!(trackers.len(), 1);
         assert_eq!(trackers[0].as_ref(), "udp://opentor.net:6969");
+    }
+
+    #[test]
+    fn redacted_for_client_drops_request_headers_only() {
+        let info = crate::stream::StreamInfo {
+            descriptor: StreamDescriptor::Http {
+                url: "http://host/live.ts".into(),
+                request_headers: [("X-API-Key".to_string(), "secret".to_string())]
+                    .into(),
+                response_headers: [(
+                    "Content-Type".to_string(),
+                    "video/mp2t".to_string(),
+                )]
+                .into(),
+            },
+            filename: Some("a.ts".into()),
+            ..Default::default()
+        };
+        let redacted = info.redacted_for_client();
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("secret") && !json.contains("X-API-Key"));
+        assert_eq!(
+            redacted
+                .filename
+                .as_deref(),
+            Some("a.ts")
+        );
+        match redacted.descriptor {
+            StreamDescriptor::Http {
+                url,
+                request_headers,
+                response_headers,
+            } => {
+                assert_eq!(url, "http://host/live.ts");
+                assert!(request_headers.is_empty());
+                assert_eq!(response_headers.len(), 1);
+            }
+            _ => panic!("descriptor variant changed"),
+        }
+        // The original keeps its headers: playback depends on them.
+        assert!(matches!(
+            &info.descriptor,
+            StreamDescriptor::Http { request_headers, .. } if request_headers.len() == 1
+        ));
     }
 
     #[test]

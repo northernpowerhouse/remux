@@ -334,6 +334,21 @@ pub(crate) async fn apply_filename_probe_fallback(
     }
 }
 
+/// The `remux` extension block of a client-facing `MediaSourceInfo`.
+///
+/// The only place a stored `StreamInfo` becomes that block, so no construction
+/// site can skip `StreamInfo::redacted_for_client`.
+pub(crate) fn client_remux_info(
+    stream_info: Option<&crate::stream::StreamInfo>,
+    source: Option<api::ProbeOrigin>,
+) -> api::MediaSourceRemuxInfo {
+    api::MediaSourceRemuxInfo {
+        provider_info: stream_info
+            .and_then(|si| serde_json::to_value(si.redacted_for_client()).ok()),
+        source,
+    }
+}
+
 impl From<db::Media> for api::MediaSourceInfo {
     fn from(source: db::Media) -> Self {
         let descriptor = source
@@ -369,13 +384,12 @@ impl From<db::Media> for api::MediaSourceInfo {
                     .as_ref()
             })
             .and_then(|r| r.source);
-        let remux = Some(api::MediaSourceRemuxInfo {
-            provider_info: source
+        let remux = Some(client_remux_info(
+            source
                 .stream_info
-                .as_ref()
-                .and_then(|si| serde_json::to_value(si).ok()),
-            source: probe_source,
-        });
+                .as_ref(),
+            probe_source,
+        ));
 
         let path = Some({
             let stem = source
@@ -945,6 +959,72 @@ mod tests {
         let video = &guess.media_streams[0];
         assert_eq!(video.video_range_type, None);
         assert_eq!(video.video_range, None);
+    }
+
+    #[test]
+    fn client_remux_info_drops_credentials_and_keeps_the_probe_origin() {
+        let info = crate::stream::StreamInfo {
+            descriptor: crate::stream::StreamDescriptor::Http {
+                url: "http://dispatcharr:9191/proxy/ts/stream/abc".into(),
+                request_headers: [("X-API-Key".to_string(), "secret".to_string())]
+                    .into(),
+                response_headers: Default::default(),
+            },
+            ..Default::default()
+        };
+        let block = client_remux_info(Some(&info), Some(api::ProbeOrigin::Ffprobe));
+        let json = block
+            .provider_info
+            .expect("provider info is still provided")
+            .to_string();
+        assert!(
+            !json.contains("secret") && !json.contains("X-API-Key"),
+            "{json}"
+        );
+        assert_eq!(block.source, Some(api::ProbeOrigin::Ffprobe));
+        assert!(
+            client_remux_info(None, None)
+                .provider_info
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn media_source_info_never_exposes_request_headers() {
+        let source = db::Media {
+            id: uuid::Uuid::new_v4(),
+            kind: db::MediaKind::Stream,
+            stream_info: Some(crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Http {
+                    url: "http://dispatcharr:9191/proxy/ts/stream/abc".into(),
+                    request_headers: [("X-API-Key".to_string(), "secret".to_string())]
+                        .into(),
+                    response_headers: Default::default(),
+                },
+                filename: Some("Movie.2023.1080p.WEB-DL.x264-GROUP.mkv".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let info = api::MediaSourceInfo::from(source);
+        let provider_info = info
+            .remux
+            .unwrap()
+            .provider_info
+            .unwrap();
+
+        let json = provider_info.to_string();
+        assert!(!json.contains("secret") && !json.contains("X-API-Key"));
+        // Ranking still recovers the release filename from the client copy.
+        let parsed: crate::stream::StreamInfo =
+            serde_json::from_value(provider_info).unwrap();
+        assert_eq!(
+            parsed
+                .filename
+                .as_deref(),
+            Some("Movie.2023.1080p.WEB-DL.x264-GROUP.mkv")
+        );
     }
 
     #[tokio::test]
