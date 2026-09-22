@@ -17,7 +17,7 @@ use crate::{
     AppState,
     addons::dispatcharr_dvr::DispatcharrRecordingStatus,
     api, db,
-    db::auth::{AdminSession, AuthSession},
+    db::auth::{AdminSession, LiveTvManagementSession, LiveTvSession},
     services::{
         DvrService,
         dvr_service::{CreateSeriesTimerRequest, CreateTimerRequest},
@@ -32,7 +32,7 @@ use crate::{
 #[get("/livetv/info")]
 pub async fn livetv_info(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     let channel_filter = db::MediaFilter {
         kind: Some(vec![db::MediaKind::TvChannel]),
@@ -77,7 +77,7 @@ pub async fn livetv_info(
 #[get("/livetv/guideinfo")]
 pub async fn livetv_guide_info(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     use sqlx::Row as _;
     let row = sqlx::query(
@@ -119,7 +119,7 @@ pub struct GetChannelsQuery {
 #[get("/livetv/channels")]
 pub async fn livetv_channels(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Query(q): Query<GetChannelsQuery>,
 ) -> Result<impl IntoResponse> {
     let mut result = db::Media::get_by_filter(
@@ -166,7 +166,7 @@ pub async fn livetv_channels(
 #[get("/livetv/channels/{channel_id}")]
 pub async fn livetv_channel(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(channel_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     let mut media = db::Media::get_by_id(
@@ -203,7 +203,7 @@ pub struct GetRecommendedQuery {
 #[get("/livetv/programs/recommended")]
 pub async fn livetv_programs_recommended(
     State(state): State<AppState>,
-    session: AuthSession,
+    session: LiveTvSession,
     Query(q): Query<GetRecommendedQuery>,
 ) -> Result<impl IntoResponse> {
     let now = Utc::now().naive_utc();
@@ -308,7 +308,7 @@ pub struct GetProgramsQuery {
 #[get("/livetv/programs")]
 pub async fn livetv_programs(
     State(state): State<AppState>,
-    session: AuthSession,
+    session: LiveTvSession,
     Query(q): Query<GetProgramsQuery>,
 ) -> Result<impl IntoResponse> {
     if q.library_series_id
@@ -449,7 +449,7 @@ pub struct GetProgramsBody {
 #[post("/livetv/programs")]
 pub async fn livetv_programs_post(
     State(state): State<AppState>,
-    session: AuthSession,
+    session: LiveTvSession,
     Json(body): Json<GetProgramsBody>,
 ) -> Result<impl IntoResponse> {
     let parse_dt = |s: &str| {
@@ -549,7 +549,7 @@ pub async fn livetv_programs_post(
 #[get("/livetv/seriestimers")]
 pub async fn livetv_series_timers(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     let items = DvrService::list_series_timers(&state.ctx).await?;
     Ok(Json(api::QueryResult {
@@ -566,7 +566,7 @@ pub async fn livetv_series_timers(
 #[post("/livetv/seriestimers")]
 pub async fn livetv_create_series_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvManagementSession,
     Json(body): Json<CreateSeriesTimerRequest>,
 ) -> Result<impl IntoResponse> {
     DvrService::create_series_timer(&state.ctx, body).await?;
@@ -580,7 +580,7 @@ pub async fn livetv_create_series_timer(
 #[get("/livetv/seriestimers/{timer_id}")]
 pub async fn livetv_get_series_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(timer_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let found = DvrService::get_series_timer(&state.ctx, &timer_id)
@@ -596,7 +596,7 @@ pub async fn livetv_get_series_timer(
 #[delete("/livetv/seriestimers/{timer_id}")]
 pub async fn livetv_delete_series_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvManagementSession,
     Path(timer_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     if DvrService::delete_series_timer(&state.ctx, &timer_id).await? {
@@ -613,7 +613,7 @@ pub async fn livetv_delete_series_timer(
 #[get("/livetv/timers")]
 pub async fn livetv_timers(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     let items = DvrService::list_timers(&state.ctx).await?;
     Ok(Json(api::QueryResult {
@@ -630,7 +630,7 @@ pub async fn livetv_timers(
 #[post("/livetv/timers")]
 pub async fn livetv_create_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvManagementSession,
     Json(body): Json<CreateTimerRequest>,
 ) -> Result<impl IntoResponse> {
     DvrService::create_timer(&state.ctx, body).await?;
@@ -644,7 +644,7 @@ pub async fn livetv_create_timer(
 #[get("/livetv/timers/{timer_id}")]
 pub async fn livetv_get_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(timer_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let timer_id = DvrService::resolve_timer_id(&state.ctx, &timer_id)
@@ -663,7 +663,7 @@ pub async fn livetv_get_timer(
 #[delete("/livetv/timers/{timer_id}")]
 pub async fn livetv_delete_timer(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvManagementSession,
     Path(timer_id): Path<String>,
 ) -> Result<impl IntoResponse> {
     let Some(timer_id) = DvrService::resolve_timer_id(&state.ctx, &timer_id).await
@@ -689,7 +689,7 @@ pub struct TimerDefaultsQuery {
 
 #[get("/livetv/timers/defaults")]
 pub async fn livetv_timer_defaults(
-    _session: AuthSession,
+    _session: LiveTvSession,
     Query(q): Query<TimerDefaultsQuery>,
 ) -> Result<impl IntoResponse> {
     #[derive(Serialize)]
@@ -723,7 +723,7 @@ pub async fn livetv_timer_defaults(
 
 #[get("/livetv/recordings/folders")]
 pub async fn livetv_recording_folders(
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     Ok(Json(api::QueryResult::<api::BaseItemDto> {
         total_record_count: 0,
@@ -739,7 +739,7 @@ pub async fn livetv_recording_folders(
 #[get("/livetv/recordings")]
 pub async fn livetv_recordings(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     let items = DvrService::list_recordings(&state.ctx).await?;
     Ok(Json(api::QueryResult {
@@ -755,7 +755,7 @@ pub async fn livetv_recordings(
 
 #[get("/livetv/recordings/groups")]
 pub async fn livetv_recording_groups(
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     Ok(Json(api::QueryResult::<api::BaseItemDto> {
         total_record_count: 0,
@@ -770,7 +770,7 @@ pub async fn livetv_recording_groups(
 
 #[get("/livetv/recordings/groups/{group_id}")]
 pub async fn livetv_recording_group(
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(_group_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     Ok(StatusCode::NOT_FOUND)
@@ -783,7 +783,7 @@ pub async fn livetv_recording_group(
 #[get("/livetv/recordings/series")]
 pub async fn livetv_recordings_series(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
 ) -> Result<impl IntoResponse> {
     let recordings = DvrService::list_recordings(&state.ctx).await?;
     let mut seen = std::collections::HashSet::new();
@@ -816,7 +816,7 @@ pub async fn livetv_recordings_series(
 #[get("/livetv/recordings/{recording_id}")]
 pub async fn livetv_recording(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(recording_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     let item = DvrService::get_recording(&state.ctx, recording_id)
@@ -828,7 +828,7 @@ pub async fn livetv_recording(
 #[delete("/livetv/recordings/{recording_id}")]
 pub async fn livetv_delete_recording(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvManagementSession,
     Path(recording_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     if DvrService::delete_recording(&state.ctx, recording_id).await? {
@@ -883,7 +883,7 @@ pub async fn livetv_live_recording_stream(
 #[get("/livetv/programs/{program_id}")]
 pub async fn livetv_program(
     State(state): State<AppState>,
-    _session: AuthSession,
+    _session: LiveTvSession,
     Path(program_id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
     let media = db::Media::get_by_id(

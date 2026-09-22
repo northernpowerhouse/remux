@@ -644,6 +644,70 @@ impl std::ops::Deref for AdminSession {
     }
 }
 
+/// Extractor for Jellyfin's `EnableLiveTvAccess` policy, which admins pass
+/// unconditionally. Derefs to AuthSession.
+pub struct LiveTvSession(pub AuthSession);
+
+impl FromRequestParts<AppState> for LiveTvSession {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let session = AuthSession::from_request_parts(parts, state).await?;
+        if !session
+            .user
+            .can_access_live_tv()
+        {
+            return Err(
+                anyhow::anyhow!("live tv access denied").context_forbidden("forbidden")
+            );
+        }
+        Ok(LiveTvSession(session))
+    }
+}
+
+impl std::ops::Deref for LiveTvSession {
+    type Target = AuthSession;
+    fn deref(&self) -> &AuthSession {
+        &self.0
+    }
+}
+
+/// Extractor for Jellyfin's `EnableLiveTvManagement` policy, which admins
+/// pass unconditionally. Derefs to AuthSession.
+///
+/// Timers and recordings live on the tuner, not in a per-user library, so a
+/// mutation by one user is a mutation for everyone.
+pub struct LiveTvManagementSession(pub AuthSession);
+
+impl FromRequestParts<AppState> for LiveTvManagementSession {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let session = AuthSession::from_request_parts(parts, state).await?;
+        if !session
+            .user
+            .can_manage_live_tv()
+        {
+            return Err(anyhow::anyhow!("live tv management denied")
+                .context_forbidden("forbidden"));
+        }
+        Ok(LiveTvManagementSession(session))
+    }
+}
+
+impl std::ops::Deref for LiveTvManagementSession {
+    type Target = AuthSession;
+    fn deref(&self) -> &AuthSession {
+        &self.0
+    }
+}
+
 // todo theres also an old emby airh header. Should we support this?
 #[derive(Debug, Clone, Default)]
 pub struct JellyfinAuthHeader {
