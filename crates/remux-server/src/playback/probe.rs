@@ -46,6 +46,39 @@ fn ffprobe_args(url: &str, allow_nonstandard_hls_extensions: bool) -> Vec<String
     args
 }
 
+#[cfg(all(test, unix))]
+mod deadline_tests {
+    use super::output_before;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn kills_a_process_that_outlives_its_deadline() {
+        let started = Instant::now();
+        let err = output_before(
+            std::process::Command::new("sleep").arg("30"),
+            Some(started + Duration::from_millis(200)),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn returns_output_of_a_process_that_finishes_in_time() {
+        let out = output_before(
+            std::process::Command::new("sh").args(["-c", "echo out; echo err >&2"]),
+            Some(Instant::now() + Duration::from_secs(10)),
+        )
+        .unwrap();
+        assert!(
+            out.status
+                .success()
+        );
+        assert_eq!(out.stdout, b"out\n");
+        assert_eq!(out.stderr, b"err\n");
+    }
+}
+
 #[cfg(test)]
 mod extension_retry_tests {
     #[test]
@@ -549,16 +582,91 @@ fn apply_video_bitrate_fallback(
     }
 }
 
+/// Run `cmd` to completion, killing it if it is still running at `deadline`.
+///
+/// `Command::output()` cannot be interrupted and dropping a `spawn_blocking`
+/// future does not stop its task, so without this a hung ffprobe outlives the
+/// caller's timeout indefinitely.
+fn output_before(
+    cmd: &mut std::process::Command,
+    deadline: Option<std::time::Instant>,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+
+    let Some(deadline) = deadline else {
+        return cmd.output();
+    };
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    // Drain both pipes on their own threads so a full pipe can't stall the child.
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            buf
+        })
+    }
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .expect("stdout is piped"),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .expect("stderr is piped"),
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "process exceeded its deadline and was killed",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: stdout
+            .join()
+            .unwrap_or_default(),
+        stderr: stderr
+            .join()
+            .unwrap_or_default(),
+    })
+}
+
 /// Probe a media URL with ffprobe and return a Jellyfin `MediaSourceInfo`
 /// alongside any chapter-derived `MediaSegments`.
 pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
-    debug!(url, "probing media");
+    probe_media_within(url, None)
+}
 
-    let mut output = std::process::Command::new(ffprobe_bin())
-        .args(ffprobe_args(url, false))
-        .hide_console()
-        .output()
-        .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
+/// Like [`probe_media`], but kills ffprobe once `timeout` has elapsed.
+pub fn probe_media_within(
+    url: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    debug!(url, "probing media");
+    let deadline = timeout.map(|t| std::time::Instant::now() + t);
+
+    let mut output = output_before(
+        std::process::Command::new(ffprobe_bin())
+            .args(ffprobe_args(url, false))
+            .hide_console(),
+        deadline,
+    )
+    .map_err(|e| anyhow!("Failed to run ffprobe: {}", e))?;
 
     if !output
         .status
@@ -567,11 +675,13 @@ pub fn probe_media(url: &str) -> Result<(api::MediaSourceInfo, MediaSegments)> {
             &output.stderr,
         ))
     {
-        output = std::process::Command::new(ffprobe_bin())
-            .args(ffprobe_args(url, true))
-            .hide_console()
-            .output()
-            .map_err(|e| anyhow!("Failed to rerun ffprobe: {}", e))?;
+        output = output_before(
+            std::process::Command::new(ffprobe_bin())
+                .args(ffprobe_args(url, true))
+                .hide_console(),
+            deadline,
+        )
+        .map_err(|e| anyhow!("Failed to rerun ffprobe: {}", e))?;
     }
 
     if !output
@@ -1076,7 +1186,9 @@ pub(crate) async fn probe_stream(
         restrict_resolution,
         port,
         db,
-        |url| probe_media(&url),
+        move |url| {
+            probe_media_within(&url, Some(std::time::Duration::from_secs(timeout_secs)))
+        },
     )
     .await
 }
