@@ -572,11 +572,33 @@ pub async fn prune_orphaned_playlists(
     }
 }
 
-pub async fn prune_stale_iptv_channels(db: &sqlx::SqlitePool, cutoff: NaiveDateTime) {
+/// Deletes TV channels not touched since `cutoff` — the import that just ran
+/// defines the current set, so anything older is gone upstream.
+///
+/// `keep_sources` holds the `iptv_source_id`s of addons whose import did not
+/// complete this run. Their rows were never refreshed, so by timestamp alone
+/// they look exactly like channels that were removed: without this, one
+/// unreachable provider would delete every channel it serves, cascading into
+/// its stream versions, guide and recordings.
+pub async fn prune_stale_iptv_channels(
+    db: &sqlx::SqlitePool,
+    cutoff: NaiveDateTime,
+    keep_sources: &[String],
+) {
     let mut qb = sqlx::QueryBuilder::new(
         "DELETE FROM media WHERE kind = 'tv_channel' AND updated_at < ",
     );
     qb.push_bind(cutoff);
+    if !keep_sources.is_empty() {
+        qb.push(
+            " AND COALESCE(json_extract(external_ids, '$.iptv_source_id'), '') NOT IN (",
+        );
+        let mut sep = qb.separated(", ");
+        for source in keep_sources {
+            sep.push_bind(source);
+        }
+        qb.push(")");
+    }
 
     match qb
         .build()
@@ -740,5 +762,60 @@ mod tests {
         assert_eq!(new_counts.get(&db::MediaKind::Series.to_string()), Some(&1));
         let members: Vec<Uuid> = sqlx::query_scalar("SELECT right_media_id FROM media_relations WHERE left_media_id = ? AND role = 'catalog'").bind(collection_id).fetch_all(&ctx.db).await.unwrap();
         assert_eq!(members, vec![fresh_id]);
+    }
+
+    #[tokio::test]
+    async fn an_addon_that_failed_to_import_keeps_its_channels() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let healthy = Uuid::from_u128(0xaaa)
+            .simple()
+            .to_string();
+        let broken = Uuid::from_u128(0xbbb)
+            .simple()
+            .to_string();
+
+        let channel = |n: u128, source: &str| db::Media {
+            id: Uuid::from_u128(n),
+            title: format!("Channel {n}"),
+            kind: db::MediaKind::TvChannel,
+            external_ids: db::ExternalIds {
+                iptv_source_id: Some(source.to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        db::Media::upsert(
+            &ctx.db,
+            &[channel(1, &healthy), channel(2, &broken), channel(3, "")],
+        )
+        .await
+        .unwrap();
+
+        // Nothing was re-imported this run, and the broken addon's catalog
+        // never opened.
+        let cutoff = chrono::Utc::now().naive_utc() + chrono::Duration::hours(1);
+        prune_stale_iptv_channels(&ctx.db, cutoff, &[broken.clone()]).await;
+
+        let left: Vec<Uuid> = db::Media::get_by_filter(
+            &ctx.db,
+            &db::MediaFilter {
+                kind: Some(vec![db::MediaKind::TvChannel]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .records
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+        assert_eq!(
+            left,
+            vec![Uuid::from_u128(2)],
+            "only the unreachable addon's channels survive a stale prune"
+        );
     }
 }
