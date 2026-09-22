@@ -55,6 +55,9 @@ impl Task for RefreshIptvTask {
             .max(1);
         let mut valid_collection_ids: HashSet<Uuid> = HashSet::new();
         let mut domain_collection_ids: HashSet<Uuid> = HashSet::new();
+        // Addons whose channels must survive the prune below because this run
+        // never managed to re-import them.
+        let mut unimported_sources: HashSet<String> = HashSet::new();
         let import_start = Utc::now().naive_utc();
 
         let catalog_progress = progress.scaled(0.0, 50.0);
@@ -109,6 +112,11 @@ impl Task for RefreshIptvTask {
                     Some(s) => s,
                     None => {
                         warn!(catalog = %full_id, "no addon found for catalog, skipping");
+                        unimported_sources.insert(
+                            addon_id
+                                .simple()
+                                .to_string(),
+                        );
                         continue;
                     }
                 };
@@ -122,6 +130,11 @@ impl Task for RefreshIptvTask {
                     Ok(s) => s,
                     Err(e) => {
                         error!(catalog = %full_id, error = %e, "failed to open catalog stream");
+                        unimported_sources.insert(
+                            addon_id
+                                .simple()
+                                .to_string(),
+                        );
                         continue;
                     }
                 };
@@ -146,7 +159,10 @@ impl Task for RefreshIptvTask {
             &domain_collection_ids,
         )
         .await;
-        prune_stale_iptv_channels(&ctx.db, import_start).await;
+        let keep_sources: Vec<String> = unimported_sources
+            .into_iter()
+            .collect();
+        prune_stale_iptv_channels(&ctx.db, import_start, &keep_sources).await;
 
         let epg_progress = progress.scaled(50.0, 100.0);
         let client = reqwest::Client::new();
