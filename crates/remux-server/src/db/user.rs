@@ -315,6 +315,27 @@ impl User {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Jellyfin's `EnableLiveTvAccess`: whether Live TV is visible to this
+    /// user at all. A user with no stored policy gets `UserPolicy`'s
+    /// defaults, where it is on.
+    pub fn can_access_live_tv(&self) -> bool {
+        self.is_admin
+            || self
+                .policy
+                .as_deref()
+                .map_or(true, |p| p.enable_live_tv_access)
+    }
+
+    /// Jellyfin's `EnableLiveTvManagement`: whether this user may schedule,
+    /// cancel or delete on a tuner every user shares.
+    pub fn can_manage_live_tv(&self) -> bool {
+        self.is_admin
+            || self
+                .policy
+                .as_deref()
+                .map_or(true, |p| p.enable_live_tv_management)
+    }
+
     pub fn can_remote_control_others(&self) -> bool {
         self.is_admin
             || self
@@ -2258,5 +2279,46 @@ mod identity_reattach_tests {
             "the orphaned legacy row should have been found via the backfilled identity"
         );
         assert_eq!(reattached.play_count, 9);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    #[test]
+    fn live_tv_policy_defaults_to_permitted_and_admins_always_pass() {
+        let no_policy = User::default();
+        assert!(no_policy.can_access_live_tv());
+        assert!(no_policy.can_manage_live_tv());
+
+        let mut denied = User {
+            policy: Some(sqlx::types::Json(crate::api::UserPolicy {
+                enable_live_tv_access: false,
+                enable_live_tv_management: false,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(!denied.can_access_live_tv());
+        assert!(!denied.can_manage_live_tv());
+
+        denied.is_admin = true;
+        assert!(denied.can_access_live_tv());
+        assert!(denied.can_manage_live_tv());
+    }
+
+    #[test]
+    fn watching_live_tv_does_not_imply_managing_the_shared_tuner() {
+        let viewer = User {
+            policy: Some(sqlx::types::Json(crate::api::UserPolicy {
+                enable_live_tv_access: true,
+                enable_live_tv_management: false,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert!(viewer.can_access_live_tv());
+        assert!(!viewer.can_manage_live_tv());
     }
 }
