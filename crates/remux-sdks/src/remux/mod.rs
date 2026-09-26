@@ -559,9 +559,12 @@ pub struct RemuxBrandingExtensions {
 #[dto]
 pub struct BrandingOptions {
     pub login_disclaimer: Option<String>,
-    #[default(Some(
-        "@import url(\"https://cdn.jsdelivr.net/gh/lscambo13/ElegantFin@main/Theme/ElegantFin-jellyfin-theme-build-latest-minified.css\");".to_string()
-    ))]
+    #[default(Some(concat!(
+        "/* Main ElegantFin CSS */\n",
+        "@import url(\"https://cdn.jsdelivr.net/gh/lscambo13/ElegantFin@main/Theme/ElegantFin-jellyfin-theme-build-latest-minified.css\");\n",
+        "/* ElegantFin 12 Companion CSS */\n",
+        "@import url(\"https://cdn.jsdelivr.net/gh/mihaif7/elegantfin-jf12@main/Theme/ElegantFin-jf12-modern-latest.css\");"
+    ).to_string()))]
     pub custom_css: Option<String>,
     pub splashscreen_enabled: Option<bool>,
     #[serde(rename = "remux")]
@@ -771,6 +774,17 @@ pub struct ServerConfiguration {
     /// is available to judge it against. Default: true.
     #[default(Some(true))]
     pub show_playback_decision_in_title: Option<bool>,
+    /// When two subtitle options exist for the same language (one embedded,
+    /// one addon-external), show only the one that actually plays without a
+    /// slow re-encode/extraction, instead of listing both. Default: true.
+    #[default(Some(true))]
+    pub deduplicate_subtitle_tracks: Option<bool>,
+    /// Only used when `deduplicate_subtitle_tracks` is false: caps how many
+    /// addon-external subtitle candidates are added per language. Embedded
+    /// tracks are never capped by this (a source has at most one per
+    /// language anyway). Default: 1.
+    #[default(Some(1_i64))]
+    pub max_external_subtitles_per_language: Option<i64>,
 }
 
 #[derive(
@@ -2635,6 +2649,18 @@ pub fn lang_to_two_letter(lang: &str) -> Option<String> {
     }
     if lang.len() == 2 {
         return Some(lang);
+    }
+    if let Some(language) = rust_iso639::from_code_2b(&lang) {
+        if !language
+            .code
+            .is_empty()
+        {
+            return Some(
+                language
+                    .code
+                    .to_string(),
+            );
+        }
     }
     isolang::Language::from_639_3(&lang)
         .or_else(|| isolang::Language::from_str(&lang).ok())
@@ -7265,6 +7291,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn branding_defaults_to_elegantfin_stylesheets() {
+        let css = BrandingOptions::default()
+            .custom_css
+            .expect("default branding should include CSS");
+        assert!(css.contains("ElegantFin-jellyfin-theme-build-latest-minified.css"));
+        assert!(css.contains("ElegantFin-jf12-modern-latest.css"));
+    }
+
+    #[test]
     fn webhook_destination_round_trips_as_tagged_config() {
         let destination = WebhookDestination::Http(HttpWebhookConfig {
             url: "https://example.com/hook".to_string(),
@@ -7316,6 +7351,10 @@ mod tests {
         assert_eq!(lang_to_two_letter("en").as_deref(), Some("en"));
         assert_eq!(lang_to_two_letter("eng").as_deref(), Some("en"));
         assert_eq!(lang_to_two_letter("English").as_deref(), Some("en"));
+        assert_eq!(lang_to_two_letter("nld").as_deref(), Some("nl"));
+        assert_eq!(lang_to_two_letter("DUT").as_deref(), Some("nl"));
+        assert_eq!(lang_to_two_letter("ger").as_deref(), Some("de"));
+        assert_eq!(lang_to_two_letter("fre").as_deref(), Some("fr"));
     }
 
     #[test]
