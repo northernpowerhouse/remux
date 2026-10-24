@@ -35,6 +35,39 @@ user picks the sidecar format: Kodi, Emby/Jellyfin or Plex.
   the option is turned back off.
 - **Tests:** 6 new; opendal 58/58; full server suite 1049 passed.
 
+### P2 as built (rev 4, 2026-10-25)
+- **Option:** `sidecar_format` (Select, `kodi` | `jellyfin` | `plex` | `none`, default
+  `kodi`). It only applies while `local_metadata` is on.
+- **Migration** `202610250001_opendal_local_meta.sql`: adds `local_meta` (JSON).
+  `local_meta_version` was dropped: the stored ids in `local_meta` are enough to
+  tell when the sidecars name a new id.
+- **Module `local_meta/`:** `nfo.rs` (Kodi/Jellyfin; BOM, no declaration, several
+  roots, HTML entities, trailing or URL-only provider links, unclosed elements) and
+  `plexmatch.rs` (`title`/`show`, `year`, `season`, the id keys, `guid`, every
+  `ep:` form; `pattern` is deferred). `LocalMeta` is the stored shape.
+- **Scan:** sidecars (`*.nfo`, `.plexmatch`) are indexed during the walk, and a pass
+  per scan root reads them for the local rows only (`apply_sidecars`):
+  - Kodi/Jellyfin: `tvshow.nfo`, `<file>.nfo` (multi-episode joined), `movie.nfo`;
+    season names from `<namedseason>`, and for Jellyfin from `season.nfo`.
+  - Plex: `.plexmatch` in the series folder (title, ids, `ep:` paths) and in the
+    season folder (`season:`, `ep:`).
+  - Sidecar numbers beat the file name. Episodes still without numbers are dropped.
+  - Movie ids, or series ids from `tvshow.nfo`/`.plexmatch`, that resolve move every
+    row with that `local_key` (subtitles too) to the IMDb id. Episode NFO ids are
+    never used for the series. Ids are looked up when the TMDB lookup ran this scan
+    or the ids changed since the last one.
+  - The title column takes the sidecar movie or series title.
+- **Read side:** catalog items, seasons (title) and episodes (title, plot, date,
+  runtime) carry the metadata. `OpendalAddon` is a `MetaAddon` for its own
+  local-only items; `Meta` is in both presets and in `available_info` while
+  `local_metadata` is on.
+- **Not in P2:** people (dropped by `save_pending_relations` anyway), `<rating>`,
+  `lockdata`, a title search with the NFO title (a sports title like "Formula 1"
+  would match the wrong show), disc-structure NFOs (`VIDEO_TS.nfo`).
+- **Tests:** 12 parser tests, 4 scan tests; opendal 62/62. The full suite passes
+  except `create_list_delete_addon_roundtrip`, which needs strem.io (no network in
+  the sandbox).
+
 ### Findings that change P2
 - **Addon resources.** `available_info` decides an addon's stored resources on
   create and on config change, unless the request names resources. The dashboard's
