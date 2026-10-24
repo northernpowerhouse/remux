@@ -18,7 +18,7 @@ use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonOption, AddonOptionType,
     AddonPreset, AddonPresetRegistration, CatalogAddon, CatalogInfo, MediaKind,
     MetaAddon, ResourceType, SearchAddon, StreamAddon, SubtitleAddon, SubtitleInfo,
-    SubtitleQuery, TreeAddon, addon,
+    SubtitleQuery, TreeAddon, addon, opendal,
 };
 use crate::{
     AppContext, common, db, sdks,
@@ -441,7 +441,7 @@ impl CatalogAddon for StremioAddon {
 #[async_trait]
 impl MetaAddon for StremioAddon {
     async fn supports(&self, media: &db::Media) -> bool {
-        stremio_type_for_kind(&media.kind).is_some()
+        stremio_type_for_kind(&media.kind).is_some() && !opendal::is_local_only(media)
     }
 
     async fn meta_fetch(
@@ -489,6 +489,7 @@ impl MetaAddon for StremioAddon {
 impl TreeAddon for StremioAddon {
     fn supports(&self, root: &db::Media) -> bool {
         matches!(root.kind, db::MediaKind::Series | db::MediaKind::Season)
+            && !opendal::is_local_only(root)
     }
 
     async fn get_children(
@@ -614,6 +615,7 @@ impl SearchAddon for StremioAddon {
 impl SubtitleAddon for StremioAddon {
     fn supports(&self, media: &db::Media) -> bool {
         matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
+            && !opendal::is_local_only(media)
     }
 
     async fn subtitle_fetch(
@@ -675,7 +677,7 @@ impl SubtitleAddon for StremioAddon {
 #[async_trait]
 impl StreamAddon for StremioAddon {
     fn supports(&self, media: &db::Media) -> bool {
-        stremio_type_for_kind(&media.kind).is_some()
+        stremio_type_for_kind(&media.kind).is_some() && !opendal::is_local_only(media)
     }
 
     async fn get_streams(

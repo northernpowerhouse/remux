@@ -52,6 +52,158 @@ fn media_kind_option() -> AddonOption {
     }
 }
 
+/// What a scan does with a movie or episode file that has no TMDB/IMDb match.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    strum_macros::Display,
+    strum_macros::EnumString,
+)]
+#[strum(serialize_all = "snake_case")]
+pub enum LocalMetadataMode {
+    /// Skip the file.
+    #[default]
+    Off,
+    /// Index the file under a local identity derived from its path.
+    Fallback,
+}
+
+impl LocalMetadataMode {
+    fn from_cfg(cfg: &serde_json::Value) -> Self {
+        cfg["local_metadata"]
+            .as_str()
+            .and_then(|s| {
+                s.parse()
+                    .ok()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn local_metadata_option() -> AddonOption {
+    AddonOption {
+        id: "local_metadata".to_string(),
+        name: "Unmatched Files".to_string(),
+        description: Some(
+            "Movies and episodes with no TMDB or IMDb match are skipped. \
+             \"Add with local metadata\" indexes them under their folder and file names instead."
+                .to_string(),
+        ),
+        required: false,
+        default: Some(serde_json::Value::String(
+            LocalMetadataMode::Off.to_string(),
+        )),
+        kind: AddonOptionType::Select {
+            options: vec![
+                AddonSelectOption {
+                    label: "Skip".to_string(),
+                    value: LocalMetadataMode::Off.to_string(),
+                },
+                AddonSelectOption {
+                    label: "Add with local metadata".to_string(),
+                    value: LocalMetadataMode::Fallback.to_string(),
+                },
+            ],
+        },
+    }
+}
+
+/// Prefix of every local identity this addon mints.
+fn local_key_prefix(addon_id: Uuid) -> String {
+    format!("opendal:{addon_id}:")
+}
+
+/// Local identity of an unmatched movie: its path without the extension, so a
+/// sidecar subtitle (`{dir}/{stem}.en.srt`) derives the same key as its video.
+fn local_movie_key(addon_id: Uuid, dir: &str, stem: &str) -> String {
+    format!("{}movie:{dir}/{stem}", local_key_prefix(addon_id))
+}
+
+/// Local identity of an unmatched series: the series folder (the first folder
+/// below the scanned directory), or for files directly in that directory their
+/// parsed series title.
+fn local_series_key(
+    addon_id: Uuid,
+    scan_base: &str,
+    rel_components: &[&str],
+    title: &str,
+) -> String {
+    let folder = match rel_components {
+        [series_dir, _, ..] => *series_dir,
+        _ => title,
+    };
+    format!(
+        "{}series:{}/{folder}",
+        local_key_prefix(addon_id),
+        scan_base.trim_end_matches('/')
+    )
+}
+
+/// Whether `media` is known only under an opendal local identity: no provider
+/// id, so a remote addon has nothing to look it up by.
+pub(crate) fn is_local_only(media: &db::Media) -> bool {
+    let ext = match media.kind {
+        db::MediaKind::Season | db::MediaKind::Episode => media
+            .grandparent
+            .as_deref()
+            .map(|gp| &gp.external_ids),
+        _ => Some(&media.external_ids),
+    };
+    ext.is_some_and(|ext| {
+        ext.imdb
+            .is_none()
+            && ext
+                .tmdb
+                .is_none()
+            && ext
+                .tvdb
+                .is_none()
+            && ext
+                .custom_stremio_id
+                .as_deref()
+                .is_some_and(|id| id.starts_with("opendal:"))
+    })
+}
+
+/// Path components of `rel_path` below `scan_dir`, the configured directory it
+/// was listed from (`/` for local roots), file name last.
+fn scan_components<'a>(rel_path: &'a str, scan_dir: &str) -> Vec<&'a str> {
+    let rel = rel_path.trim_matches('/');
+    let base = scan_dir.trim_matches('/');
+    let rel = if base.is_empty() {
+        rel
+    } else {
+        rel.strip_prefix(base)
+            .map(|r| r.trim_start_matches('/'))
+            .unwrap_or(rel)
+    };
+    rel.split('/')
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// Season and episode of a year-numbered episode code (`S2026E91`), which the
+/// filename parser does not recognise.
+fn year_season_episode(stem: &str) -> Option<(i64, i64)> {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)(?:^|[^a-z0-9])s((?:19|20)\d\d)[ ._-]?e(\d{1,4})(?:[^0-9]|$)")
+            .unwrap()
+    });
+    let caps = RE.captures(stem)?;
+    Some((
+        caps[1]
+            .parse()
+            .ok()?,
+        caps[2]
+            .parse()
+            .ok()?,
+    ))
+}
+
 fn cfg_paths_local(cfg: &serde_json::Value) -> Result<Vec<String>> {
     if let Some(arr) = cfg["paths"].as_array() {
         let v: Vec<String> = arr
@@ -139,6 +291,7 @@ impl AddonPreset for OpendalLocalPreset {
                     default: None,
                     kind: AddonOptionType::StringList,
                 },
+                local_metadata_option(),
             ],
         }
     }
@@ -269,6 +422,7 @@ impl AddonPreset for OpendalWebdavPreset {
                     default: Some(serde_json::Value::Bool(false)),
                     kind: AddonOptionType::Boolean,
                 },
+                local_metadata_option(),
             ],
         }
     }
@@ -351,6 +505,62 @@ pub struct OpendalFile {
     pub size: Option<i64>,
     #[sqlx(default)]
     pub probe_data: Option<sqlx::types::Json<crate::api::MediaSourceInfo>>,
+}
+
+impl OpendalAddon {
+    /// The local identity this addon gave `media`, if any.
+    fn own_local_key<'a>(&self, media: &'a db::Media) -> Option<&'a str> {
+        media
+            .external_ids
+            .custom_stremio_id
+            .as_deref()
+            .filter(|id| id.starts_with(&local_key_prefix(self.addon_id)))
+    }
+
+    /// Column and value that select the files of a movie or series: its IMDb
+    /// id, or the local identity this addon gave it.
+    fn files_key<'a>(&self, media: &'a db::Media) -> Option<(&'static str, &'a str)> {
+        if let Some(imdb) = media
+            .external_ids
+            .imdb
+            .as_deref()
+        {
+            return Some(("imdb_id", imdb));
+        }
+        self.own_local_key(media)
+            .map(|key| ("local_key", key))
+    }
+
+    /// Movies or series this addon indexed under a local identity.
+    async fn local_catalog_items(
+        &self,
+        ctx: &AppContext,
+        file_kind: &str,
+        kind: db::MediaKind,
+    ) -> Result<Vec<db::Media>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT local_key, MIN(title) FROM opendal_files \
+             WHERE addon_id = ? AND media_kind = ? AND imdb_id IS NULL AND local_key IS NOT NULL \
+             GROUP BY local_key",
+        )
+        .bind(self.addon_id)
+        .bind(file_kind)
+        .fetch_all(&ctx.db)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, title)| db::Media {
+                id: common::stable_media_uuid(&kind, &key),
+                title: title.unwrap_or_default(),
+                kind: kind.clone(),
+                external_ids: db::ExternalIds {
+                    custom_stremio_id: Some(key),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -441,6 +651,10 @@ impl CatalogAddon for OpendalAddon {
                     },
                     ..Default::default()
                 })
+                .chain(
+                    self.local_catalog_items(ctx, "episode", db::MediaKind::Series)
+                        .await?,
+                )
                 .collect()
             }
             "track" => {
@@ -574,6 +788,10 @@ impl CatalogAddon for OpendalAddon {
                     },
                     ..Default::default()
                 })
+                .chain(
+                    self.local_catalog_items(ctx, "movie", db::MediaKind::Movie)
+                        .await?,
+                )
                 .collect()
             }
         };
@@ -637,9 +855,8 @@ impl SubtitleAddon for OpendalAddon {
         {
             "movie" => {
                 media.kind == db::MediaKind::Movie
-                    && media
-                        .external_ids
-                        .imdb
+                    && self
+                        .files_key(media)
                         .is_some()
             }
             "episode" => {
@@ -647,9 +864,8 @@ impl SubtitleAddon for OpendalAddon {
                     && media
                         .grandparent
                         .as_deref()
-                        .map_or(false, |gp| {
-                            gp.external_ids
-                                .imdb
+                        .is_some_and(|gp| {
+                            self.files_key(gp)
                                 .is_some()
                         })
             }
@@ -664,14 +880,10 @@ impl SubtitleAddon for OpendalAddon {
         db: &sqlx::SqlitePool,
     ) -> Result<Vec<SubtitleInfo>> {
         let files: Vec<OpendalFile> = if self.media_kind == "episode" {
-            let Some(imdb_id) = media
+            let Some((column, key)) = media
                 .grandparent
                 .as_deref()
-                .and_then(|gp| {
-                    gp.external_ids
-                        .imdb
-                        .as_deref()
-                })
+                .and_then(|gp| self.files_key(gp))
             else {
                 return Ok(vec![]);
             };
@@ -681,33 +893,29 @@ impl SubtitleAddon for OpendalAddon {
             let episode = media
                 .idx
                 .unwrap_or(0);
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 "SELECT path, name, title, imdb_id, season, episode, track_number, year, size \
                  FROM opendal_files \
                  WHERE addon_id = ? AND media_kind = 'subtitle' \
-                 AND imdb_id = ? AND season = ? AND episode = ?",
-            )
+                 AND {column} = ? AND season = ? AND episode = ?"
+            ))
             .bind(self.addon_id)
-            .bind(imdb_id)
+            .bind(key)
             .bind(season)
             .bind(episode)
             .fetch_all(db)
             .await?
         } else {
-            let Some(imdb_id) = media
-                .external_ids
-                .imdb
-                .as_deref()
-            else {
+            let Some((column, key)) = self.files_key(media) else {
                 return Ok(vec![]);
             };
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 "SELECT path, name, title, imdb_id, season, episode, track_number, year, size \
                  FROM opendal_files \
-                 WHERE addon_id = ? AND media_kind = 'subtitle' AND imdb_id = ?",
-            )
+                 WHERE addon_id = ? AND media_kind = 'subtitle' AND {column} = ?"
+            ))
             .bind(self.addon_id)
-            .bind(imdb_id)
+            .bind(key)
             .fetch_all(db)
             .await?
         };
@@ -746,9 +954,8 @@ impl StreamAddon for OpendalAddon {
         {
             "movie" => {
                 media.kind == db::MediaKind::Movie
-                    && media
-                        .external_ids
-                        .imdb
+                    && self
+                        .files_key(media)
                         .is_some()
             }
             "episode" => {
@@ -756,9 +963,8 @@ impl StreamAddon for OpendalAddon {
                     && media
                         .grandparent
                         .as_deref()
-                        .map_or(false, |gp| {
-                            gp.external_ids
-                                .imdb
+                        .is_some_and(|gp| {
+                            self.files_key(gp)
                                 .is_some()
                         })
             }
@@ -816,33 +1022,25 @@ impl StreamAddon for OpendalAddon {
             .fetch_all(&ctx.db)
             .await?
         } else {
-            let imdb_id = if self.media_kind == "episode" {
+            let files_key = if self.media_kind == "episode" {
                 media
                     .grandparent
                     .as_deref()
-                    .and_then(|gp| {
-                        gp.external_ids
-                            .imdb
-                            .as_deref()
-                    })
+                    .and_then(|gp| self.files_key(gp))
             } else {
-                media
-                    .external_ids
-                    .imdb
-                    .as_deref()
+                self.files_key(media)
             };
-            let imdb_id = match imdb_id {
-                Some(id) => id,
-                None => return Ok(vec![]),
+            let Some((column, key)) = files_key else {
+                return Ok(vec![]);
             };
-            sqlx::query_as(
+            sqlx::query_as(&format!(
                 "SELECT path, name, title, imdb_id, season, episode, track_number, year, size, probe_data \
                  FROM opendal_files \
-                 WHERE addon_id = ? AND media_kind = ? AND imdb_id = ?",
-            )
+                 WHERE addon_id = ? AND media_kind = ? AND {column} = ?"
+            ))
             .bind(self.addon_id)
             .bind(&self.media_kind)
-            .bind(imdb_id)
+            .bind(key)
             .fetch_all(&ctx.db)
             .await?
         };
@@ -1000,21 +1198,17 @@ impl TreeAddon for OpendalAddon {
 
         match root.kind {
             db::MediaKind::Series => {
-                let Some(imdb_id) = root
-                    .external_ids
-                    .imdb
-                    .as_deref()
-                else {
+                let Some((column, series_key)) = self.files_key(root) else {
                     return Ok(None);
                 };
-                let season_nums: Vec<i64> = sqlx::query_scalar(
+                let season_nums: Vec<i64> = sqlx::query_scalar(&format!(
                     "SELECT DISTINCT season FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' \
-                       AND imdb_id = ? AND season IS NOT NULL \
-                     ORDER BY season",
-                )
+                       AND {column} = ? AND season IS NOT NULL \
+                     ORDER BY season"
+                ))
                 .bind(self.addon_id)
-                .bind(imdb_id)
+                .bind(series_key)
                 .fetch_all(&ctx.db)
                 .await?;
 
@@ -1028,7 +1222,7 @@ impl TreeAddon for OpendalAddon {
                     .map(|s| db::Media {
                         id: common::get_stable_uuid(format!(
                             "season:{}:{}",
-                            imdb_id, s
+                            series_key, s
                         )),
                         title: crate::addons::season_title(s),
                         kind: db::MediaKind::Season,
@@ -1070,11 +1264,7 @@ impl TreeAddon for OpendalAddon {
                 let Some(gp) = gp else {
                     return Ok(None);
                 };
-                let Some(series_imdb) = gp
-                    .external_ids
-                    .imdb
-                    .as_deref()
-                else {
+                let Some((column, series_key)) = self.files_key(&gp) else {
                     return Ok(None);
                 };
                 let Some(season_num) = root.idx else {
@@ -1084,16 +1274,16 @@ impl TreeAddon for OpendalAddon {
                     .parent_id
                     .unwrap_or(root.id);
 
-                let files: Vec<OpendalFile> = sqlx::query_as(
+                let files: Vec<OpendalFile> = sqlx::query_as(&format!(
                     "SELECT path, name, title, imdb_id, season, episode, \
                             track_number, year, size \
                      FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' \
-                       AND imdb_id = ? AND season = ? \
-                     ORDER BY episode",
-                )
+                       AND {column} = ? AND season = ? \
+                     ORDER BY episode"
+                ))
                 .bind(self.addon_id)
-                .bind(series_imdb)
+                .bind(series_key)
                 .bind(season_num)
                 .fetch_all(&ctx.db)
                 .await?;
@@ -1124,7 +1314,7 @@ impl TreeAddon for OpendalAddon {
                         Some(db::Media {
                             id: common::get_stable_uuid(format!(
                                 "episode:{}:{}:{}",
-                                series_imdb, season_num, ep_num
+                                series_key, season_num, ep_num
                             )),
                             title,
                             kind: db::MediaKind::Episode,
@@ -1160,6 +1350,27 @@ impl TreeAddon for OpendalAddon {
 // ---------------------------------------------------------------------------
 
 const SUBTITLE_EXTENSIONS: &[&str] = &["srt", "ass", "ssa", "vtt", "sub", "sup"];
+
+/// Title of an unmatched series from its folder name, when it has one.
+fn local_series_title(rel_components: &[&str]) -> Option<String> {
+    let [series_dir, _, ..] = rel_components else {
+        return None;
+    };
+    let parsed = hunch::hunch(series_dir);
+    Some(
+        parsed
+            .title()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(series_dir)
+            .to_string(),
+    )
+}
+
+/// Directory part of a stored path (`""` for a bare name).
+fn parent_dir(path: &str) -> &str {
+    path.rsplit_once('/')
+        .map_or("", |(dir, _)| dir)
+}
 
 /// Extract the file stem (filename without the last extension).
 fn stem_without_ext(name: &str) -> String {
@@ -1274,19 +1485,7 @@ fn music_layout(
     rel_path: &str,
     scan_dir: &str,
 ) -> (Option<String>, Option<String>, Option<i64>) {
-    let rel = rel_path.trim_matches('/');
-    let base = scan_dir.trim_matches('/');
-    let rel = if base.is_empty() {
-        rel
-    } else {
-        rel.strip_prefix(base)
-            .map(|r| r.trim_start_matches('/'))
-            .unwrap_or(rel)
-    };
-    let mut dirs: Vec<&str> = rel
-        .split('/')
-        .filter(|c| !c.is_empty())
-        .collect();
+    let mut dirs = scan_components(rel_path, scan_dir);
     dirs.pop(); // the file itself
 
     static DISC_DIR: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
@@ -1332,8 +1531,13 @@ async fn scan_addon(
         .preset
         .kind
         == "opendal-local";
+    let local_mode = if media_kind == "track" {
+        LocalMetadataMode::Off
+    } else {
+        LocalMetadataMode::from_cfg(cfg)
+    };
 
-    info!(addon = %addon.name, kind = %addon.preset.kind, media_kind, "opendal: scanning");
+    info!(addon = %addon.name, kind = %addon.preset.kind, media_kind, %local_mode, "opendal: scanning");
 
     let is_media_ext: fn(&str) -> bool = if media_kind == "track" {
         |ext| {
@@ -1417,6 +1621,13 @@ async fn scan_addon(
     };
 
     for (operator, list_from, path_prefix) in scan_roots {
+        // Local identities are anchored here: the root for local scans, the
+        // listed sub-path for WebDAV.
+        let scan_base = if path_prefix.is_empty() {
+            list_from.as_str()
+        } else {
+            path_prefix.as_str()
+        };
         let (mut single, mut lister) = open_scan_source(
             &operator,
             &list_from,
@@ -1472,104 +1683,66 @@ async fn scan_addon(
                 let (base_stem, _, _, _) = split_subtitle_stem(&stem);
                 let jellyfin_ids = db::ExternalIds::from_path(&path);
                 let parsed = hunch::hunch(&base_stem);
+                let is_tv = media_kind == "episode";
 
-                let (imdb_id, season, episode, year, title_str) =
-                    match media_kind.as_str() {
-                        "episode" => {
-                            let season = parsed
+                let (season, episode) = if is_tv {
+                    year_season_episode(&base_stem)
+                        .map(|(s, e)| (Some(s), Some(e)))
+                        .unwrap_or((
+                            parsed
                                 .season()
-                                .map(|s| s as i64);
-                            let episode = parsed
+                                .map(|s| s as i64),
+                            parsed
                                 .episode()
-                                .map(|e| e as i64);
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    resolve_path_ids(
-                                        &mut path_id_memo,
-                                        &jellyfin_ids,
-                                        true,
-                                        client,
-                                    )
-                                    .await
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        None,
-                                        true,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, season, episode, year, clean_title)
-                        }
-                        _ => {
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    resolve_path_ids(
-                                        &mut path_id_memo,
-                                        &jellyfin_ids,
-                                        false,
-                                        client,
-                                    )
-                                    .await
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        year,
-                                        false,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, None, None, year, clean_title)
-                        }
-                    };
+                                .map(|e| e as i64),
+                        ))
+                } else {
+                    (None, None)
+                };
+                let year = parsed
+                    .year()
+                    .map(|y| y as i64);
+                let title_str = parsed
+                    .title()
+                    .unwrap_or(base_stem.as_str())
+                    .to_string();
 
-                if imdb_id.is_none() {
+                let matched = match_file(
+                    ctx,
+                    addon.id,
+                    &path,
+                    &jellyfin_ids,
+                    &title_str,
+                    if is_tv { None } else { year },
+                    is_tv,
+                    tmdb,
+                    &mut path_id_memo,
+                )
+                .await?;
+                let local_key = if matched
+                    .imdb_id
+                    .is_some()
+                    || local_mode == LocalMetadataMode::Off
+                {
+                    None
+                } else if is_tv {
+                    (season.is_some() && episode.is_some()).then(|| {
+                        local_series_key(
+                            addon.id,
+                            scan_base,
+                            &scan_components(&entry_rel, &list_from),
+                            &title_str,
+                        )
+                    })
+                } else {
+                    Some(local_movie_key(addon.id, parent_dir(&path), &base_stem))
+                };
+
+                if matched
+                    .imdb_id
+                    .is_none()
+                    && local_key.is_none()
+                {
                     debug!(path, "opendal: subtitle has no IMDB id, skipping");
                     continue;
                 }
@@ -1581,25 +1754,33 @@ async fn scan_addon(
                     .to_string();
                 sqlx::query(
                     "INSERT INTO opendal_files \
-                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
-                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?) \
+                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at, local_key, match_attempted_at) \
+                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?) \
                      ON CONFLICT(id) DO UPDATE SET \
                        path = excluded.path, name = excluded.name, \
                        title = excluded.title, \
                        imdb_id = COALESCE(opendal_files.imdb_id, excluded.imdb_id), \
                        season = excluded.season, episode = excluded.episode, \
-                       year = excluded.year, scanned_at = excluded.scanned_at",
+                       year = excluded.year, scanned_at = excluded.scanned_at, \
+                       local_key = excluded.local_key, \
+                       match_attempted_at = excluded.match_attempted_at",
                 )
                 .bind(sub_id)
                 .bind(addon.id)
                 .bind(&path)
                 .bind(&name)
                 .bind(&title_str)
-                .bind(imdb_id.as_deref())
+                .bind(
+                    matched
+                        .imdb_id
+                        .as_deref(),
+                )
                 .bind(season)
                 .bind(episode)
                 .bind(year)
                 .bind(&now)
+                .bind(local_key.as_deref())
+                .bind(matched.attempted_at)
                 .execute(&ctx.db)
                 .await?;
 
@@ -1725,6 +1906,8 @@ async fn scan_addon(
 
             let jellyfin_ids = db::ExternalIds::from_path(&path);
 
+            let mut local_key: Option<String> = None;
+            let mut match_attempted_at: Option<chrono::NaiveDateTime> = None;
             let (title, season, episode, track_number, year, imdb_id) = match media_kind
                 .as_str()
             {
@@ -1753,12 +1936,16 @@ async fn scan_addon(
                 }
                 "episode" => {
                     let parsed = hunch::hunch(&stem);
-                    let season = parsed
-                        .season()
-                        .map(|s| s as i64);
-                    let episode = parsed
-                        .episode()
-                        .map(|e| e as i64);
+                    let (season, episode) = year_season_episode(&stem)
+                        .map(|(s, e)| (Some(s), Some(e)))
+                        .unwrap_or((
+                            parsed
+                                .season()
+                                .map(|s| s as i64),
+                            parsed
+                                .episode()
+                                .map(|e| e as i64),
+                        ));
 
                     // When the filename starts with the episode code (e.g. "S01E07 - Title"),
                     // hunch finds no title before it and returns None. In that case the series
@@ -1795,46 +1982,45 @@ async fn scan_addon(
                         }
                     };
 
-                    let existing_imdb =
-                        fetch_existing_imdb(ctx, addon.id, &stored_path).await?;
-                    let imdb_id = if let Some(id) = existing_imdb {
-                        Some(id)
-                    } else if !jellyfin_ids.is_empty() {
-                        if let Some(client) = tmdb {
-                            resolve_path_ids(
-                                &mut path_id_memo,
-                                &jellyfin_ids,
-                                true,
-                                client,
-                            )
-                            .await
-                        } else {
-                            jellyfin_ids
-                                .imdb
-                                .clone()
-                                .map(Into::into)
-                        }
+                    let matched = match_file(
+                        ctx,
+                        addon.id,
+                        &stored_path,
+                        &jellyfin_ids,
+                        &clean_title,
+                        None,
+                        true,
+                        tmdb,
+                        &mut path_id_memo,
+                    )
+                    .await?;
+                    match_attempted_at = matched.attempted_at;
+                    let title = if matched
+                        .imdb_id
+                        .is_some()
+                    {
+                        clean_title
+                    } else if local_mode == LocalMetadataMode::Off
+                        || season.is_none()
+                        || episode.is_none()
+                    {
+                        debug!(path, title = %clean_title, "opendal: no IMDB id, skipping");
+                        // Not seen, so a row an earlier scan stored under a
+                        // local identity is pruned.
+                        seen_ids.pop();
+                        continue;
                     } else {
-                        if let Some(client) = tmdb {
-                            MediaResolveService::resolve_imdb_from_search(
-                                client,
-                                &clean_title,
-                                None,
-                                true,
-                            )
-                            .await
-                            .map(Into::into)
-                        } else {
-                            None
-                        }
+                        let rel = scan_components(&entry_rel, &list_from);
+                        local_key = Some(local_series_key(
+                            addon.id,
+                            scan_base,
+                            &rel,
+                            &clean_title,
+                        ));
+                        local_series_title(&rel).unwrap_or(clean_title)
                     };
 
-                    if imdb_id.is_none() {
-                        debug!(path, title = %clean_title, "opendal: no IMDB id, skipping");
-                        continue;
-                    }
-
-                    (Some(clean_title), season, episode, None, year, imdb_id)
+                    (Some(title), season, episode, None, year, matched.imdb_id)
                 }
                 _ => {
                     // movie
@@ -1845,46 +2031,35 @@ async fn scan_addon(
                     let clean_title =
                         movie_title_from_stem(&stem, parsed.title(), year);
 
-                    let existing_imdb =
-                        fetch_existing_imdb(ctx, addon.id, &stored_path).await?;
-                    let imdb_id = if let Some(id) = existing_imdb {
-                        Some(id)
-                    } else if !jellyfin_ids.is_empty() {
-                        if let Some(client) = tmdb {
-                            resolve_path_ids(
-                                &mut path_id_memo,
-                                &jellyfin_ids,
-                                false,
-                                client,
-                            )
-                            .await
-                        } else {
-                            jellyfin_ids
-                                .imdb
-                                .clone()
-                                .map(Into::into)
+                    let matched = match_file(
+                        ctx,
+                        addon.id,
+                        &stored_path,
+                        &jellyfin_ids,
+                        &clean_title,
+                        year,
+                        false,
+                        tmdb,
+                        &mut path_id_memo,
+                    )
+                    .await?;
+                    match_attempted_at = matched.attempted_at;
+                    if matched
+                        .imdb_id
+                        .is_none()
+                    {
+                        if local_mode == LocalMetadataMode::Off {
+                            debug!(path, title = %clean_title, "opendal: no IMDB id, skipping");
+                            // Not seen, so a row an earlier scan stored under a
+                            // local identity is pruned.
+                            seen_ids.pop();
+                            continue;
                         }
-                    } else {
-                        if let Some(client) = tmdb {
-                            MediaResolveService::resolve_imdb_from_search(
-                                client,
-                                &clean_title,
-                                year,
-                                false,
-                            )
-                            .await
-                            .map(Into::into)
-                        } else {
-                            None
-                        }
-                    };
-
-                    if imdb_id.is_none() {
-                        debug!(path, title = %clean_title, "opendal: no IMDB id, skipping");
-                        continue;
+                        local_key =
+                            Some(local_movie_key(addon.id, parent_dir(&path), &stem));
                     }
 
-                    (Some(clean_title), None, None, None, year, imdb_id)
+                    (Some(clean_title), None, None, None, year, matched.imdb_id)
                 }
             };
 
@@ -1928,8 +2103,8 @@ async fn scan_addon(
 
             let insert_result = sqlx::query(
                 "INSERT INTO opendal_files \
-                 (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at, artist, album, disc_number) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at, artist, album, disc_number, local_key, match_attempted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                    path = excluded.path, \
                    name = excluded.name, media_kind = excluded.media_kind, \
@@ -1940,6 +2115,8 @@ async fn scan_addon(
                    year = excluded.year, size = excluded.size, scanned_at = excluded.scanned_at, \
                    artist = excluded.artist, album = excluded.album, \
                    disc_number = excluded.disc_number, \
+                   local_key = excluded.local_key, \
+                   match_attempted_at = excluded.match_attempted_at, \
                    probe_data = CASE WHEN ? IS NOT NULL AND ? IS NOT opendal_files.probe_version THEN NULL ELSE opendal_files.probe_data END",
             )
             .bind(row_id)
@@ -1958,6 +2135,8 @@ async fn scan_addon(
             .bind(artist.as_deref())
             .bind(album.as_deref())
             .bind(disc_number)
+            .bind(local_key.as_deref())
+            .bind(match_attempted_at)
             .bind(probe_version.as_deref())
             .bind(probe_version.as_deref())
             .execute(&ctx.db)
@@ -2526,19 +2705,107 @@ async fn resolve_path_ids(
     resolved
 }
 
-async fn fetch_existing_imdb(
+/// What a previous scan stored for a path.
+#[derive(sqlx::FromRow, Default)]
+struct StoredMatch {
+    imdb_id: Option<String>,
+    local_key: Option<String>,
+    match_attempted_at: Option<chrono::NaiveDateTime>,
+}
+
+async fn fetch_stored_match(
     ctx: &AppContext,
     addon_id: Uuid,
     path: &str,
-) -> Result<Option<String>> {
-    Ok(sqlx::query_scalar(
-        "SELECT imdb_id FROM opendal_files WHERE addon_id = ? AND path = ?",
+) -> Result<StoredMatch> {
+    Ok(sqlx::query_as(
+        "SELECT imdb_id, local_key, match_attempted_at FROM opendal_files \
+         WHERE addon_id = ? AND path = ?",
     )
     .bind(addon_id)
     .bind(path)
     .fetch_optional(&ctx.db)
     .await?
-    .flatten())
+    .unwrap_or_default())
+}
+
+/// How long a file indexed under a local identity waits before its next TMDB
+/// lookup.
+fn unmatched_retry_after() -> chrono::Duration {
+    chrono::Duration::days(7)
+}
+
+struct FileMatch {
+    imdb_id: Option<String>,
+    /// When the last lookup that found nothing ran; `None` once matched.
+    attempted_at: Option<chrono::NaiveDateTime>,
+}
+
+/// IMDb id of a scanned file: the one stored for its path, else its
+/// Jellyfin-style path ids, else a TMDB title search. A file already indexed
+/// under a local identity is not looked up again until
+/// `unmatched_retry_after` has passed.
+#[allow(clippy::too_many_arguments)]
+async fn match_file(
+    ctx: &AppContext,
+    addon_id: Uuid,
+    lookup_path: &str,
+    path_ids: &db::ExternalIds,
+    title: &str,
+    search_year: Option<i64>,
+    is_tv: bool,
+    tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
+    memo: &mut PathIdMemo,
+) -> Result<FileMatch> {
+    let stored = fetch_stored_match(ctx, addon_id, lookup_path).await?;
+    if stored
+        .imdb_id
+        .is_some()
+    {
+        return Ok(FileMatch {
+            imdb_id: stored.imdb_id,
+            attempted_at: None,
+        });
+    }
+    let now = Utc::now().naive_utc();
+    if let Some(at) = stored
+        .match_attempted_at
+        .filter(|at| {
+            stored
+                .local_key
+                .is_some()
+                && now - *at < unmatched_retry_after()
+        })
+    {
+        return Ok(FileMatch {
+            imdb_id: None,
+            attempted_at: Some(at),
+        });
+    }
+    let imdb_id = match tmdb {
+        Some(client) if !path_ids.is_empty() => {
+            resolve_path_ids(memo, path_ids, is_tv, client).await
+        }
+        None if !path_ids.is_empty() => path_ids
+            .imdb
+            .clone()
+            .map(Into::into),
+        Some(client) => MediaResolveService::resolve_imdb_from_search(
+            client,
+            title,
+            search_year,
+            is_tv,
+        )
+        .await
+        .map(Into::into),
+        None => None,
+    };
+    Ok(FileMatch {
+        attempted_at: imdb_id
+            .is_none()
+            .then_some(now),
+        imdb_id,
+    })
 }
 
 async fn prune_stale_paths(
@@ -2873,6 +3140,16 @@ mod tests {
         dir: &std::path::Path,
         media_kind: &str,
     ) -> (OpendalAddon, Addon) {
+        make_local_addon_with(ctx, dir, media_kind, serde_json::json!({})).await
+    }
+
+    /// `make_local_addon` with `extra` merged into the addon config.
+    async fn make_local_addon_with(
+        ctx: &AppContext,
+        dir: &std::path::Path,
+        media_kind: &str,
+        extra: serde_json::Value,
+    ) -> (OpendalAddon, Addon) {
         let addon_id = Uuid::new_v4();
         let root = dir
             .to_str()
@@ -2880,16 +3157,19 @@ mod tests {
             .to_string();
         let now = Utc::now().naive_utc();
 
+        let mut config = serde_json::json!({
+            "media_kind": media_kind,
+            "paths": [root],
+        });
+        if let (Some(cfg), Some(extra)) = (config.as_object_mut(), extra.as_object()) {
+            cfg.extend(extra.clone());
+        }
         let db_addon = Addon {
             id: addon_id,
             name: "test-local".to_string(),
             preset: AddonPresetRef {
                 kind: "opendal-local".to_string(),
-                config: serde_json::json!({
-                    "media_kind": media_kind,
-                    "paths": [root],
-                })
-                .into(),
+                config: config.into(),
             },
             resources: vec![ResourceType::Stream, ResourceType::Catalog],
             types: vec![],
@@ -6136,5 +6416,330 @@ mod tests {
         assert_eq!(index.unchanged_rows("Movies/A/", old), Some(vec![a_id]));
         assert_eq!(index.unchanged_rows("Movies/C/", old), None);
         assert_eq!(index.unchanged_rows("Movies/A/", None), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // Unmatched files under a local identity (`local_metadata`)
+    // -----------------------------------------------------------------------
+
+    /// A TMDB mock whose searches find nothing.
+    fn tmdb_finding_nothing() -> httpmock::MockServer {
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path_contains("/search/");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "page": 1,
+                    "results": [],
+                    "total_pages": 0,
+                    "total_results": 0
+                }));
+        });
+        tmdb
+    }
+
+    fn fallback_cfg() -> serde_json::Value {
+        serde_json::json!({ "local_metadata": "fallback" })
+    }
+
+    async fn file_count(ctx: &AppContext, addon_id: Uuid) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM opendal_files WHERE addon_id = ?")
+            .bind(addon_id)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap()
+    }
+
+    #[test]
+    fn year_season_episode_codes() {
+        assert_eq!(
+            year_season_episode("Formula 1 - S2026E91 - Singapore Grand Prix - Race"),
+            Some((2026, 91))
+        );
+        assert_eq!(
+            year_season_episode("Formula.1.s2026.e07.Race"),
+            Some((2026, 7))
+        );
+        assert_eq!(year_season_episode("Show S01E02"), None);
+        assert_eq!(year_season_episode("XS2026E91"), None);
+        assert_eq!(year_season_episode("S2026E91234"), None);
+    }
+
+    #[tokio::test]
+    async fn unmatched_movie_is_skipped_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[("Home Videos/Birthday Party 2026.mkv", b"fake")],
+        );
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "movie").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        assert_eq!(file_count(&ctx, db_addon.id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn unmatched_movie_is_indexed_under_a_local_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Home Videos/Birthday Party 2026.mkv", b"fake"),
+                ("Home Videos/Birthday Party 2026.en.srt", b"sub"),
+            ],
+        );
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) =
+            make_local_addon_with(&ctx, dir.path(), "movie", fallback_cfg()).await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let root = dir
+            .path()
+            .to_str()
+            .unwrap();
+        let key = local_movie_key(
+            db_addon.id,
+            &format!("{root}/Home Videos"),
+            "Birthday Party 2026",
+        );
+        let items: Vec<db::Media> = addon
+            .catalog_stream(&ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1);
+        let movie = &items[0];
+        assert_eq!(movie.kind, db::MediaKind::Movie);
+        assert_eq!(
+            movie
+                .external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            movie.id,
+            common::stable_media_uuid(&db::MediaKind::Movie, &key)
+        );
+        assert_eq!(movie.title, "Birthday Party");
+        assert!(is_local_only(movie));
+        assert!(StreamAddon::supports(&addon, movie));
+
+        let streams = addon
+            .get_streams(movie, &ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(
+            matches!(&streams[0].descriptor, StreamDescriptor::Local(p) if p.ends_with("Birthday Party 2026.mkv"))
+        );
+
+        let subs = addon
+            .subtitle_fetch(movie, &SubtitleQuery::default(), &ctx.db)
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(
+            subs[0]
+                .lang
+                .as_deref(),
+            Some("en")
+        );
+    }
+
+    #[tokio::test]
+    async fn unmatched_series_builds_a_local_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let race = "Formula 1/Season 2026/Formula 1 - S2026E91 - Singapore Grand Prix - Race - WEBDL-2160p [gofile] sportarr-ev-174552";
+        let race_mkv = format!("{race}.mkv");
+        let race_srt = format!("{race}.en.srt");
+        let race_nfo = format!("{race}.nfo");
+        write_files(
+            dir.path(),
+            &[
+                (race_mkv.as_str(), b"fake"),
+                (race_srt.as_str(), b"sub"),
+                (race_nfo.as_str(), b"<episodedetails/>"),
+                (
+                    "Formula 1/Season 2026/Formula 1 - S2026E90 - Singapore Grand Prix - Qualifying - WEBDL-2160p [gofile] sportarr-ev-174551.mkv",
+                    b"fake",
+                ),
+                (
+                    "Formula 1/Season 2025/Formula 1 - S2025E12 - Monaco Grand Prix - Race.mkv",
+                    b"fake",
+                ),
+            ],
+        );
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) =
+            make_local_addon_with(&ctx, dir.path(), "episode", fallback_cfg()).await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let root = dir
+            .path()
+            .to_str()
+            .unwrap();
+        let key = format!("opendal:{}:series:{root}/Formula 1", db_addon.id);
+        let items: Vec<db::Media> = addon
+            .catalog_stream(&ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        assert_eq!(items.len(), 1, "one series for the whole folder");
+        let series = &items[0];
+        assert_eq!(series.kind, db::MediaKind::Series);
+        assert_eq!(series.title, "Formula 1");
+        assert_eq!(
+            series
+                .external_ids
+                .custom_stremio_id
+                .as_deref(),
+            Some(key.as_str())
+        );
+        assert!(is_local_only(series));
+
+        let seasons = addon
+            .get_children(series, &ctx)
+            .await
+            .unwrap()
+            .expect("seasons");
+        let season_nums: Vec<i64> = seasons
+            .iter()
+            .filter_map(|s| s.idx)
+            .collect();
+        assert_eq!(season_nums, vec![2025, 2026]);
+
+        let season_2026 = seasons
+            .iter()
+            .find(|s| s.idx == Some(2026))
+            .unwrap();
+        let episodes = addon
+            .get_children(season_2026, &ctx)
+            .await
+            .unwrap()
+            .expect("episodes");
+        let episode_nums: Vec<i64> = episodes
+            .iter()
+            .filter_map(|e| e.idx)
+            .collect();
+        assert_eq!(episode_nums, vec![90, 91]);
+
+        let race_episode = episodes
+            .iter()
+            .find(|e| e.idx == Some(91))
+            .unwrap();
+        assert!(is_local_only(race_episode));
+        assert!(StreamAddon::supports(&addon, race_episode));
+        let streams = addon
+            .get_streams(race_episode, &ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(
+            matches!(&streams[0].descriptor, StreamDescriptor::Local(p) if p.ends_with(&race_mkv))
+        );
+        let subs = addon
+            .subtitle_fetch(race_episode, &SubtitleQuery::default(), &ctx.db)
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unmatched_file_is_looked_up_again_only_after_the_retry_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[("Home Videos/Birthday Party 2026.mkv", b"fake")],
+        );
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) =
+            make_local_addon_with(&ctx, dir.path(), "movie", fallback_cfg()).await;
+        let attempted_at = || async {
+            sqlx::query_scalar::<_, chrono::NaiveDateTime>(
+                "SELECT match_attempted_at FROM opendal_files WHERE addon_id = ?",
+            )
+            .bind(db_addon.id)
+            .fetch_one(&ctx.db)
+            .await
+            .unwrap()
+        };
+
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        let first = attempted_at().await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        assert_eq!(attempted_at().await, first, "a recent miss is not retried");
+
+        let stale = Utc::now().naive_utc() - chrono::Duration::days(8);
+        sqlx::query(
+            "UPDATE opendal_files SET match_attempted_at = ? WHERE addon_id = ?",
+        )
+        .bind(stale)
+        .bind(db_addon.id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        assert!(attempted_at().await > stale, "an old miss is retried");
+    }
+
+    #[tokio::test]
+    async fn turning_local_metadata_off_drops_unmatched_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[("Home Videos/Birthday Party 2026.mkv", b"fake")],
+        );
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, mut db_addon) =
+            make_local_addon_with(&ctx, dir.path(), "movie", fallback_cfg()).await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        assert_eq!(file_count(&ctx, db_addon.id).await, 1);
+
+        let mut cfg = db_addon
+            .preset
+            .config
+            .expose()
+            .clone();
+        cfg["local_metadata"] = serde_json::json!("off");
+        db_addon
+            .preset
+            .config = cfg.into();
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        assert_eq!(file_count(&ctx, db_addon.id).await, 0);
     }
 }
