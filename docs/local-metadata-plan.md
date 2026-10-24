@@ -68,6 +68,31 @@ user picks the sidecar format: Kodi, Emby/Jellyfin or Plex.
   except `create_list_delete_addon_roundtrip`, which needs strem.io (no network in
   the sandbox).
 
+### P3 as built (rev 5, 2026-10-25)
+- **Profiles:** `local_meta/artwork.rs` holds the per-format name tables from §4.2
+  for movie, series, season and episode art (Primary, Backdrop, Logo, Thumb).
+  Extensions: jpg, jpeg, png, webp, tbn. Season names take `NN`, unpadded and
+  year forms; `season-specials-*` for season 0; `season-all-*` for Kodi only.
+- **NFO links:** `<thumb aspect=…>` (with `type="season" season="N"`) and
+  `<fanart><thumb>` (relative to `<fanart url=…>`) remote URLs fill any kind no
+  local file covers. Jellyfin's local `<art>` paths are ignored, since the
+  name lookup finds those files anyway.
+- **Store:** images are indexed during the walk with their listed size and
+  mtime, and copied to `{data_dir}/meta/local-art/{sha256}.{ext}` (next to the
+  existing `meta/library` uploads, not `metadata/` as first planned). Each
+  `LocalImage` keeps its `source` (`path|size|mtime`), so an unchanged file is
+  not read again. `local_meta` gains `images` and `season_images`.
+- **`sync_from_media`:** also replaces rows whose path is under
+  `meta/local-art/` (both separators). `db::LOCAL_ART_DIR` names the folder.
+- **GC:** `collect_art_garbage` runs after a scan with `local_metadata` on. It
+  keeps copies a `media_images` row or any `local_meta` refers to, and copies
+  younger than an hour.
+- **Tests:** 4 artwork-table tests, 1 NFO-link test, 1 `sync_from_media` test,
+  3 scan tests. Opendal test servers now use a temporary `data_dir`.
+- **Pre-existing issue found:** the image endpoint treats a path as local only
+  when it starts with `/`, so on Windows uploads and these copies are fetched as
+  URLs. Not fixed here.
+
 ### Findings that change P2
 - **Addon resources.** `available_info` decides an addon's stored resources on
   create and on config change, unless the request names resources. The dashboard's
@@ -403,9 +428,9 @@ row references.
 
 | Phase | Scope | Unblocks |
 |---|---|---|
-| P1 | `local_metadata` option; index unmatched files under `local_key`; catalog, tree, stream and subtitle by key; year-season regex; Stremio skip; re-search throttle. Titles come from filename and folder. | Sports show up at all |
-| P2 | NFO parser (Kodi/Jellyfin) and `.plexmatch`; `opendal_folders`; sidecar ids feed matching; opendal `MetaAddon` | Titles, plots, dates, genres |
-| P3 | Artwork profiles for all three formats; local-art store; `sync_from_media` guard; GC | Posters, fanart, thumbs |
+| P1 (done) | `local_metadata` option; index unmatched files under `local_key`; catalog, tree, stream and subtitle by key; year-season regex; Stremio skip; re-search throttle. Titles come from filename and folder. | Sports show up at all |
+| P2 (done) | NFO parser (Kodi/Jellyfin) and `.plexmatch`; `opendal_folders`; sidecar ids feed matching; opendal `MetaAddon` | Titles, plots, dates, genres |
+| P3 (done) | Artwork profiles for all three formats; local-art store; `sync_from_media` guard; GC | Posters, fanart, thumbs |
 | P4 | Plex `{…}` path ids (if not folded into P1) | Plex-organised libraries |
 | P5 | `embedded_metadata`: format tags and cover art via the probe | DVR recordings, tagged MP4s |
 | P6 | `prefer` mode | Curated NFOs beat TMDB |
