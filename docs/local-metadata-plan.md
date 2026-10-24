@@ -68,6 +68,17 @@ user picks the sidecar format: Kodi, Emby/Jellyfin or Plex.
   except `create_list_delete_addon_roundtrip`, which needs strem.io (no network in
   the sandbox).
 
+### P4 as built (rev 6, 2026-10-25)
+- **`ExternalIds::from_path`** also reads Plex's `{tmdb-603}`, `{imdb-tt…}`,
+  `{tvdb-…}` (and the `…id-` spellings). Each tag must close with its own
+  bracket; other Plex tags such as `{edition-…}` are not ids.
+- **Titles:** `without_id_tags` strips both tag forms before `hunch` parses movie,
+  episode, subtitle and series-folder titles. Without a year to cut at, hunch
+  kept the tag (`The Matrix imdb-tt0133093`). Local identities still use the raw
+  stems, so existing keys are unchanged.
+- **Tests:** 2 `from_path` tests, 1 title test, 1 scan test (a Plex-named series
+  resolves via TVDB, with a clean series title).
+
 ### P3 as built (rev 5, 2026-10-25)
 - **Profiles:** `local_meta/artwork.rs` holds the per-format name tables from §4.2
   for movie, series, season and episode art (Primary, Backdrop, Logo, Thumb).
@@ -431,7 +442,7 @@ row references.
 | P1 (done) | `local_metadata` option; index unmatched files under `local_key`; catalog, tree, stream and subtitle by key; year-season regex; Stremio skip; re-search throttle. Titles come from filename and folder. | Sports show up at all |
 | P2 (done) | NFO parser (Kodi/Jellyfin) and `.plexmatch`; `opendal_folders`; sidecar ids feed matching; opendal `MetaAddon` | Titles, plots, dates, genres |
 | P3 (done) | Artwork profiles for all three formats; local-art store; `sync_from_media` guard; GC | Posters, fanart, thumbs |
-| P4 | Plex `{…}` path ids (if not folded into P1) | Plex-organised libraries |
+| P4 (done) | Plex `{…}` path ids (if not folded into P1) | Plex-organised libraries |
 | P5 | `embedded_metadata`: format tags and cover art via the probe | DVR recordings, tagged MP4s |
 | P6 | `prefer` mode | Curated NFOs beat TMDB |
 
