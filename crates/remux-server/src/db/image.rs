@@ -25,6 +25,11 @@ pub enum ImageKind {
     Thumb,
 }
 
+/// Name of the folder (under `{data_dir}/meta`) holding addon copies of local
+/// sidecar artwork. Unlike user uploads, images stored there are replaced by
+/// `MediaImage::sync_from_media`.
+pub const LOCAL_ART_DIR: &str = "local-art";
+
 /// A single image row from `media_images`.
 #[derive(Debug, Clone, sqlx::FromRow, Serialize, Deserialize)]
 pub struct MediaImage {
@@ -91,11 +96,12 @@ impl MediaImage {
     }
 
     /// Persist addon-sourced images. Replaces an existing row only when the
-    /// stored path is a provider URL (starts with "http") and the new path
-    /// differs — so a higher-priority addon's artwork wins on every refresh
-    /// while user uploads and generated placeholders (local paths) are never
-    /// touched. The `id` is regenerated on replace so clients that cache by id
-    /// pick up the new artwork.
+    /// stored path is a provider URL (starts with "http") or a copy of local
+    /// sidecar artwork (in `meta/local-art`), and the new path differs — so a
+    /// higher-priority addon's artwork wins on every refresh while user uploads
+    /// and generated placeholders (other local paths) are never touched. The
+    /// `id` is regenerated on replace so clients that cache by id pick up the
+    /// new artwork.
     pub async fn sync_from_media(
         db: &SqlitePool,
         media_id: Uuid,
@@ -111,7 +117,8 @@ impl MediaImage {
                    path = excluded.path, \
                    width = excluded.width, \
                    height = excluded.height \
-                 WHERE media_images.path LIKE 'http%' \
+                 WHERE (media_images.path LIKE 'http%' \
+                        OR media_images.path LIKE ? OR media_images.path LIKE ?) \
                    AND media_images.path <> excluded.path",
             )
             .bind(Uuid::new_v4())
@@ -121,6 +128,8 @@ impl MediaImage {
             .bind(&image.path)
             .bind(image.width)
             .bind(image.height)
+            .bind(format!("%/meta/{LOCAL_ART_DIR}/%"))
+            .bind(format!("%\\meta\\{LOCAL_ART_DIR}\\%"))
             .execute(db)
             .await?;
         }
@@ -376,6 +385,45 @@ mod tests {
             .id;
 
         assert_eq!(id_first, id_second);
+    }
+
+    #[tokio::test]
+    async fn local_art_copy_is_replaced_but_an_upload_is_not() {
+        let db = test_db().await;
+        let media_id = insert_stub_media(&db).await;
+        let art = |hash: &str| format!("/data/meta/{LOCAL_ART_DIR}/{hash}.jpg");
+
+        MediaImage::sync_from_media(&db, media_id, &primary(&art("aa")))
+            .await
+            .unwrap();
+        MediaImage::sync_from_media(&db, media_id, &primary(&art("bb")))
+            .await
+            .unwrap();
+        let path = |db: SqlitePool| async move {
+            MediaImage::get_for_media(&db, &media_id)
+                .await
+                .unwrap()
+                .get(ImageKind::Primary)
+                .unwrap()
+                .path
+                .clone()
+        };
+        assert_eq!(path(db.clone()).await, art("bb"));
+
+        MediaImage::save(
+            &db,
+            media_id,
+            ImageKind::Primary,
+            "/data/meta/library/x/primary.jpg",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        MediaImage::sync_from_media(&db, media_id, &primary(&art("cc")))
+            .await
+            .unwrap();
+        assert_eq!(path(db).await, "/data/meta/library/x/primary.jpg");
     }
 
     #[tokio::test]

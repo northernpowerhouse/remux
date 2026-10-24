@@ -11,7 +11,7 @@ use quick_xml::{events::Event, reader::Reader};
 use regex::Regex;
 
 use super::{LocalMeta, SidecarIds, sidecar_text};
-use crate::db;
+use crate::db::{self, ImageKind};
 
 /// What an NFO's root element describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,17 @@ pub struct Nfo {
     pub episode_end: Option<i64>,
     /// `<namedseason number="N">` names from a Kodi `tvshow.nfo`.
     pub named_seasons: BTreeMap<i64, String>,
+    /// Remote artwork the NFO links to.
+    pub art: Vec<NfoArt>,
+}
+
+/// A `<thumb>` or `<fanart><thumb>` URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NfoArt {
+    pub kind: ImageKind,
+    pub url: String,
+    /// For a season image in a `tvshow.nfo`, the season it shows.
+    pub season: Option<i64>,
 }
 
 /// Parses an NFO file into its root elements, first to last. A file with no
@@ -73,6 +84,7 @@ pub fn parse(bytes: &[u8]) -> Vec<Nfo> {
             episode: None,
             episode_end: None,
             named_seasons: BTreeMap::new(),
+            art: Vec::new(),
         }),
         None => {}
     }
@@ -472,7 +484,74 @@ fn nfo_from_element(el: &Element) -> Nfo {
         episode: el.child_number("episode"),
         episode_end: el.child_number("episodenumberend"),
         named_seasons,
+        art: nfo_art(el),
     }
+}
+
+fn is_http_url(text: &str) -> bool {
+    text.starts_with("http://") || text.starts_with("https://")
+}
+
+/// Kodi's `<thumb aspect=…>` (`season="N" type="season"` for a season image)
+/// and `<fanart>` thumbs, which may be relative to the `<fanart url=…>`.
+/// Only remote URLs are kept; Jellyfin's local `<art>` paths name files the
+/// artwork lookup finds anyway.
+fn nfo_art(el: &Element) -> Vec<NfoArt> {
+    let mut out = Vec::new();
+    for thumb in el.children_named("thumb") {
+        let url = thumb
+            .text
+            .trim();
+        if !is_http_url(url) {
+            continue;
+        }
+        let kind = match thumb.attr("aspect") {
+            None | Some("poster") | Some("thumb") => ImageKind::Primary,
+            Some("landscape") => ImageKind::Thumb,
+            Some("clearlogo") | Some("logo") => ImageKind::Logo,
+            Some("fanart") => ImageKind::Backdrop,
+            Some(_) => continue,
+        };
+        let season = match thumb.attr("type") {
+            Some("season") => match thumb
+                .attr("season")
+                .and_then(leading_number)
+            {
+                Some(n) => Some(n),
+                // `season="-1"`: every season, which Remux has no slot for.
+                None => continue,
+            },
+            _ => None,
+        };
+        out.push(NfoArt {
+            kind,
+            url: url.to_string(),
+            season,
+        });
+    }
+    for fanart in el.children_named("fanart") {
+        let base = fanart
+            .attr("url")
+            .unwrap_or_default();
+        for thumb in fanart.children_named("thumb") {
+            let text = thumb
+                .text
+                .trim();
+            let url = if is_http_url(text) {
+                text.to_string()
+            } else if is_http_url(base) && !text.is_empty() {
+                format!("{}{text}", base.trim_end_matches('/'))
+            } else {
+                continue;
+            };
+            out.push(NfoArt {
+                kind: ImageKind::Backdrop,
+                url,
+                season: None,
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -679,6 +758,44 @@ mod tests {
             Some(1399)
         );
         assert!(parse(b"not an nfo").is_empty());
+    }
+
+    #[test]
+    fn reads_remote_artwork_links() {
+        let docs = parse(
+            br#"<tvshow>
+  <thumb aspect="poster">https://img.example/poster.jpg</thumb>
+  <thumb aspect="banner">https://img.example/banner.jpg</thumb>
+  <thumb aspect="poster" type="season" season="2">https://img.example/s2.jpg</thumb>
+  <thumb aspect="poster" type="season" season="-1">https://img.example/all.jpg</thumb>
+  <thumb>/local/poster.jpg</thumb>
+  <fanart url="https://img.example/t/p/original"><thumb preview="/w780/f.jpg">/f.jpg</thumb></fanart>
+</tvshow>"#,
+        );
+        let art: Vec<(ImageKind, &str, Option<i64>)> = docs[0]
+            .art
+            .iter()
+            .map(|a| {
+                (
+                    a.kind,
+                    a.url
+                        .as_str(),
+                    a.season,
+                )
+            })
+            .collect();
+        assert_eq!(
+            art,
+            vec![
+                (ImageKind::Primary, "https://img.example/poster.jpg", None),
+                (ImageKind::Primary, "https://img.example/s2.jpg", Some(2)),
+                (
+                    ImageKind::Backdrop,
+                    "https://img.example/t/p/original/f.jpg",
+                    None
+                ),
+            ]
+        );
     }
 
     #[test]

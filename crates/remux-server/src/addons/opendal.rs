@@ -223,11 +223,13 @@ fn item_meta(meta: LocalMeta, kind: &db::MediaKind) -> Option<LocalMeta> {
             .map(|s| *s)?,
         db::MediaKind::Season => LocalMeta {
             title: meta.season_title,
+            images: meta.season_images,
             ..Default::default()
         },
         _ => LocalMeta {
             series: None,
             season_title: None,
+            season_images: Vec::new(),
             ..meta
         },
     };
@@ -1369,17 +1371,18 @@ impl TreeAddon for OpendalAddon {
                 let Some((column, series_key)) = self.files_key(root) else {
                     return Ok(None);
                 };
-                let season_nums: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
-                    "SELECT season, MAX(json_extract(local_meta, '$.season_title')) \
+                let season_nums: Vec<(i64, Option<sqlx::types::Json<LocalMeta>>)> =
+                    sqlx::query_as(&format!(
+                        "SELECT season, MAX(local_meta) \
                      FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' \
                        AND {column} = ? AND season IS NOT NULL \
                      GROUP BY season ORDER BY season"
-                ))
-                .bind(self.addon_id)
-                .bind(series_key)
-                .fetch_all(&ctx.db)
-                .await?;
+                    ))
+                    .bind(self.addon_id)
+                    .bind(series_key)
+                    .fetch_all(&ctx.db)
+                    .await?;
 
                 if season_nums.is_empty() {
                     return Ok(None);
@@ -1388,19 +1391,29 @@ impl TreeAddon for OpendalAddon {
                 let gp_box = Some(Arc::new(root.clone()));
                 let seasons = season_nums
                     .into_iter()
-                    .map(|(s, title)| db::Media {
-                        id: common::get_stable_uuid(format!(
-                            "season:{}:{}",
-                            series_key, s
-                        )),
-                        title: title.unwrap_or_else(|| crate::addons::season_title(s)),
-                        kind: db::MediaKind::Season,
-                        parent_id: Some(root.id),
-                        grandparent_id: Some(root.id),
-                        idx: Some(s),
-                        parent_idx: Some(s),
-                        grandparent: gp_box.clone(),
-                        ..Default::default()
+                    .map(|(s, meta)| {
+                        let mut season = db::Media {
+                            id: common::get_stable_uuid(format!(
+                                "season:{}:{}",
+                                series_key, s
+                            )),
+                            title: crate::addons::season_title(s),
+                            kind: db::MediaKind::Season,
+                            parent_id: Some(root.id),
+                            grandparent_id: Some(root.id),
+                            idx: Some(s),
+                            parent_idx: Some(s),
+                            grandparent: gp_box.clone(),
+                            ..Default::default()
+                        };
+                        // Every episode row of a season carries the same season
+                        // metadata, so any one of them will do.
+                        if let Some(meta) =
+                            meta.and_then(|m| item_meta(m.0, &db::MediaKind::Season))
+                        {
+                            meta.apply_to(&mut season);
+                        }
+                        season
                     })
                     .collect();
 
@@ -1968,7 +1981,7 @@ async fn scan_addon(
             }
 
             if sidecar_format != SidecarFormat::None && is_sidecar_name(&name, &ext) {
-                sidecars.insert(&entry_rel);
+                sidecars.insert(&entry_rel, entry.metadata());
                 continue;
             }
 
@@ -2424,6 +2437,19 @@ async fn scan_addon(
 
     let deleted = prune_stale_paths(ctx, addon.id, &seen_ids).await?;
     run_probe_jobs(ctx, addon, probe_jobs).await;
+    if local_mode != LocalMetadataMode::Off {
+        match local_meta::collect_art_garbage(
+            &ctx.db,
+            &ctx.config
+                .data_dir,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => debug!(deleted = n, "opendal: removed unused artwork copies"),
+            Err(e) => warn!(error = %e, "opendal: failed to clean up artwork copies"),
+        }
+    }
 
     info!(
         addon = %addon.name,
@@ -3033,26 +3059,65 @@ async fn match_file(
 /// Largest sidecar file that is read.
 const MAX_SIDECAR_BYTES: usize = 1 << 20;
 
+/// Largest artwork file that is copied.
+const MAX_ART_BYTES: usize = 32 << 20;
+
+/// NFO and `.plexmatch` files, and pictures that may be artwork.
 fn is_sidecar_name(name: &str, ext: &str) -> bool {
-    ext == "nfo" || name.eq_ignore_ascii_case(".plexmatch")
+    ext == "nfo"
+        || name.eq_ignore_ascii_case(".plexmatch")
+        || local_meta::artwork::is_image_ext(ext)
+}
+
+/// A sidecar file the walk passed.
+struct SidecarEntry {
+    rel: String,
+    /// Size and modified time as listed; `None` when the lister reports
+    /// neither (local scans).
+    listed: Option<(u64, Option<chrono::DateTime<Utc>>)>,
 }
 
 /// Sidecar files a scan walked past, by operator-relative path. Lookups ignore
 /// case, as Kodi, Jellyfin and Plex do.
 #[derive(Default)]
-struct SidecarIndex(std::collections::HashMap<String, String>);
+struct SidecarIndex(std::collections::HashMap<String, SidecarEntry>);
 
 impl SidecarIndex {
-    fn insert(&mut self, rel: &str) {
+    fn insert(&mut self, rel: &str, meta: &opendal::Metadata) {
         let rel = rel.trim_matches('/');
+        let listed = (meta.content_length() > 0
+            || meta
+                .last_modified()
+                .is_some())
+        .then(|| (meta.content_length(), meta.last_modified()));
         self.0
-            .insert(rel.to_lowercase(), rel.to_string());
+            .insert(
+                rel.to_lowercase(),
+                SidecarEntry {
+                    rel: rel.to_string(),
+                    listed,
+                },
+            );
+    }
+
+    fn entry(&self, dir: &str, name: &str) -> Option<&SidecarEntry> {
+        self.0
+            .get(&join_rel(dir, name).to_lowercase())
     }
 
     fn find(&self, dir: &str, name: &str) -> Option<&str> {
-        self.0
-            .get(&join_rel(dir, name).to_lowercase())
-            .map(String::as_str)
+        self.entry(dir, name)
+            .map(|e| {
+                e.rel
+                    .as_str()
+            })
+    }
+
+    /// The picture named `{base}.{ext}` in `dir`, trying each image extension.
+    fn find_image(&self, dir: &str, base: &str) -> Option<&SidecarEntry> {
+        local_meta::artwork::IMAGE_EXTENSIONS
+            .iter()
+            .find_map(|ext| self.entry(dir, &format!("{base}.{ext}")))
     }
 }
 
@@ -3089,22 +3154,29 @@ struct LocalRow {
     searched: bool,
 }
 
-/// Reads and parses sidecars, each file once per scan.
+/// Reads and parses sidecars, and copies artwork into the local-art store,
+/// each file once per scan.
 struct SidecarReader<'a> {
     operator: &'a opendal::Operator,
     index: &'a SidecarIndex,
+    format: SidecarFormat,
+    art_dir: std::path::PathBuf,
+    /// Store paths of the copies earlier scans made, by their `source`.
+    previous_art: std::collections::HashMap<String, String>,
     nfo: std::collections::HashMap<String, Arc<Vec<local_meta::nfo::Nfo>>>,
     plexmatch: std::collections::HashMap<String, Arc<local_meta::plexmatch::PlexMatch>>,
+    /// Copies made this scan, by the image's operator-relative path.
+    art: std::collections::HashMap<String, Option<(String, String)>>,
 }
 
 impl SidecarReader<'_> {
-    async fn read(&self, rel: &str) -> Option<Vec<u8>> {
+    async fn read_limited(&self, rel: &str, limit: usize) -> Option<Vec<u8>> {
         match self
             .operator
             .read(rel)
             .await
         {
-            Ok(buf) if buf.len() <= MAX_SIDECAR_BYTES => Some(buf.to_vec()),
+            Ok(buf) if buf.len() <= limit => Some(buf.to_vec()),
             Ok(_) => {
                 debug!(path = rel, "opendal: sidecar too large, ignoring");
                 None
@@ -3114,6 +3186,115 @@ impl SidecarReader<'_> {
                 None
             }
         }
+    }
+
+    async fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        self.read_limited(rel, MAX_SIDECAR_BYTES)
+            .await
+    }
+
+    /// Store path and source of the copy of the image at `entry`, copying it
+    /// when it is new or changed.
+    async fn copy_art(&self, entry: &SidecarEntry) -> Option<(String, String)> {
+        let (len, modified) = match entry.listed {
+            Some(listed) => listed,
+            None => {
+                let meta = self
+                    .operator
+                    .stat(&entry.rel)
+                    .await
+                    .ok()?;
+                (meta.content_length(), meta.last_modified())
+            }
+        };
+        let source = format!(
+            "{}|{len}|{}",
+            entry.rel,
+            modified.map_or(0, |m| m.timestamp())
+        );
+        if let Some(path) = self
+            .previous_art
+            .get(&source)
+            .filter(|path| std::path::Path::new(path).exists())
+        {
+            return Some((path.clone(), source));
+        }
+        let bytes = self
+            .read_limited(&entry.rel, MAX_ART_BYTES)
+            .await?;
+        let path = local_meta::store_art(&self.art_dir, &entry.rel, &bytes)
+            .await
+            .inspect_err(|e| warn!(path = entry.rel, error = %e, "opendal: failed to copy artwork"))
+            .ok()?;
+        Some((path, source))
+    }
+
+    /// The artwork of `level`: the first local file found per image kind,
+    /// then the NFO's remote links for kinds still missing.
+    async fn artwork(
+        &mut self,
+        level: local_meta::artwork::ArtLevel,
+        stem: &str,
+        dirs: local_meta::artwork::ArtDirs<'_>,
+        links: impl Iterator<Item = &local_meta::nfo::NfoArt>,
+    ) -> Vec<local_meta::LocalImage> {
+        let mut images: Vec<local_meta::LocalImage> = Vec::new();
+        for candidate in local_meta::artwork::candidates(self.format, level, stem, dirs)
+        {
+            if images
+                .iter()
+                .any(|i| i.kind == candidate.kind)
+            {
+                continue;
+            }
+            let Some(entry) = self
+                .index
+                .find_image(&candidate.dir, &candidate.base)
+            else {
+                continue;
+            };
+            let copied = match self
+                .art
+                .get(&entry.rel)
+            {
+                Some(copied) => copied.clone(),
+                None => {
+                    let copied = self
+                        .copy_art(entry)
+                        .await;
+                    self.art
+                        .insert(
+                            entry
+                                .rel
+                                .clone(),
+                            copied.clone(),
+                        );
+                    copied
+                }
+            };
+            if let Some((path, source)) = copied {
+                images.push(local_meta::LocalImage {
+                    kind: candidate.kind,
+                    path,
+                    source: Some(source),
+                });
+            }
+        }
+        for link in links {
+            if !images
+                .iter()
+                .any(|i| i.kind == link.kind)
+            {
+                images.push(local_meta::LocalImage {
+                    kind: link.kind,
+                    path: link
+                        .url
+                        .clone(),
+                    source: None,
+                });
+            }
+        }
+        images
     }
 
     async fn nfo(
@@ -3190,6 +3371,7 @@ async fn movie_sidecars(
             .unwrap_or_default(),
     );
     let mut meta = LocalMeta::default();
+    let mut links = Vec::new();
     if format.reads_nfo() {
         for name in [format!("{stem}.nfo"), "movie.nfo".to_string()] {
             if let Some(docs) = reader
@@ -3202,11 +3384,26 @@ async fn movie_sidecars(
                     meta = doc
                         .meta
                         .clone();
+                    links = doc
+                        .art
+                        .clone();
                     break;
                 }
             }
         }
     }
+    meta.images = reader
+        .artwork(
+            local_meta::artwork::ArtLevel::Movie,
+            &stem,
+            local_meta::artwork::ArtDirs {
+                file_dir: dir,
+                series_dir: None,
+                season_dir: None,
+            },
+            links.iter(),
+        )
+        .await;
     SidecarFindings {
         ids: meta
             .ids
@@ -3244,6 +3441,8 @@ async fn episode_sidecars(
     let mut season_title = None;
     let mut season = None;
     let mut number = None;
+    let mut show_links: Vec<nfo::NfoArt> = Vec::new();
+    let mut episode_links: Vec<nfo::NfoArt> = Vec::new();
 
     if format.reads_nfo() {
         let mut named_seasons = Default::default();
@@ -3261,6 +3460,9 @@ async fn episode_sidecars(
                         .clone();
                     named_seasons = show
                         .named_seasons
+                        .clone();
+                    show_links = show
+                        .art
                         .clone();
                 }
             }
@@ -3280,6 +3482,9 @@ async fn episode_sidecars(
                 }
                 season = ep.season;
                 number = ep.episode;
+                episode_links = ep
+                    .art
+                    .clone();
                 episode = LocalMeta {
                     // Ids in an episode NFO are the episode's, not the series'.
                     ids: Default::default(),
@@ -3361,9 +3566,50 @@ async fn episode_sidecars(
         }
     }
 
+    use local_meta::artwork::{ArtDirs, ArtLevel};
+    let dirs = ArtDirs {
+        file_dir: dir,
+        series_dir: row
+            .series_dir
+            .as_deref(),
+        season_dir,
+    };
+    series.images = reader
+        .artwork(
+            ArtLevel::Series,
+            &stem,
+            dirs,
+            show_links
+                .iter()
+                .filter(|l| {
+                    l.season
+                        .is_none()
+                }),
+        )
+        .await;
+    let season_images = match season.or(row.season) {
+        Some(n) => {
+            reader
+                .artwork(
+                    ArtLevel::Season(n),
+                    &stem,
+                    dirs,
+                    show_links
+                        .iter()
+                        .filter(|l| l.season == Some(n)),
+                )
+                .await
+        }
+        None => Vec::new(),
+    };
+    episode.images = reader
+        .artwork(ArtLevel::Episode, &stem, dirs, episode_links.iter())
+        .await;
+
     let ids = std::mem::take(&mut series.ids);
     let meta = LocalMeta {
         season_title,
+        season_images,
         series: (!series.is_empty()).then(|| Box::new(series)),
         ..episode
     };
@@ -3394,32 +3640,51 @@ async fn apply_sidecars(
     if rows.is_empty() {
         return Ok(Vec::new());
     }
-    // Ids the previous scan read, so ids that are new since then are looked up
-    // even while the row's TMDB lookup is throttled.
-    let stored_ids: std::collections::HashMap<Uuid, local_meta::SidecarIds> =
-        sqlx::query_as::<_, (Uuid, sqlx::types::Json<LocalMeta>)>(
-            "SELECT id, local_meta FROM opendal_files \
-             WHERE addon_id = ? AND local_key IS NOT NULL AND local_meta IS NOT NULL",
-        )
-        .bind(addon_id)
-        .fetch_all(&ctx.db)
-        .await?
-        .into_iter()
-        .map(|(id, meta)| {
-            let meta = meta.0;
-            let ids = match meta.series {
-                Some(series) => series.ids,
-                None => meta.ids,
-            };
-            (id, ids)
-        })
-        .collect();
+    // What the previous scan read: ids that are new since then are looked up
+    // even while the row's TMDB lookup is throttled, and unchanged artwork is
+    // not copied again.
+    let stored: Vec<(Uuid, sqlx::types::Json<LocalMeta>)> = sqlx::query_as(
+        "SELECT id, local_meta FROM opendal_files \
+         WHERE addon_id = ? AND local_key IS NOT NULL AND local_meta IS NOT NULL",
+    )
+    .bind(addon_id)
+    .fetch_all(&ctx.db)
+    .await?;
+    let mut previous_art: std::collections::HashMap<String, String> =
+        Default::default();
+    let mut stored_ids: std::collections::HashMap<Uuid, local_meta::SidecarIds> =
+        Default::default();
+    for (id, meta) in stored {
+        let meta = meta.0;
+        for image in meta.all_images() {
+            if let Some(source) = &image.source {
+                previous_art.insert(
+                    source.clone(),
+                    image
+                        .path
+                        .clone(),
+                );
+            }
+        }
+        let ids = match meta.series {
+            Some(series) => series.ids,
+            None => meta.ids,
+        };
+        stored_ids.insert(id, ids);
+    }
 
     let mut reader = SidecarReader {
         operator,
         index,
+        format,
+        art_dir: local_meta::local_art_dir(
+            &ctx.config
+                .data_dir,
+        ),
+        previous_art,
         nfo: Default::default(),
         plexmatch: Default::default(),
+        art: Default::default(),
     };
     let mut resolved: std::collections::HashMap<String, Option<String>> =
         Default::default();
@@ -3860,6 +4125,9 @@ mod tests {
             torrent_http_port: None,
             disable_dht: true,
             tmdb_base_url: tmdb.base_url(),
+            // Artwork copies go here, not into the real data directory.
+            data_dir: std::env::temp_dir()
+                .join(format!("remux-opendal-test-{}", Uuid::new_v4())),
             ..Default::default()
         })
         .await
@@ -7767,6 +8035,210 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(subs.len(), 1, "the subtitle moves with its movie");
+    }
+
+    fn image_path(media: &db::Media, kind: db::ImageKind) -> Option<String> {
+        media
+            .images
+            .get_path(kind)
+            .map(str::to_string)
+    }
+
+    #[tokio::test]
+    async fn movie_artwork_is_copied_into_the_local_art_store() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Films/Some Film.mkv", b"fake"),
+                ("Films/Some Film-poster.jpg", b"poster-1"),
+                ("Films/fanart.png", b"fanart"),
+                (
+                    "Films/Some Film.nfo",
+                    b"<movie><title>Some Film</title>\
+                      <thumb aspect=\"clearlogo\">https://img.example/logo.png</thumb>\
+                      <thumb aspect=\"poster\">https://img.example/poster.jpg</thumb></movie>",
+                ),
+            ],
+        );
+        let (ctx, _guard, _tmdb, addon, db_addon) =
+            scan_local(dir.path(), "movie", serde_json::json!({})).await;
+        let art_dir = local_meta::local_art_dir(
+            &ctx.config
+                .data_dir,
+        );
+
+        let movie = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        let poster = image_path(&movie, db::ImageKind::Primary).unwrap();
+        assert!(
+            poster.starts_with(
+                art_dir
+                    .to_str()
+                    .unwrap()
+            ),
+            "{poster}"
+        );
+        assert_eq!(std::fs::read(&poster).unwrap(), b"poster-1");
+        let fanart = image_path(&movie, db::ImageKind::Backdrop).unwrap();
+        assert!(fanart.ends_with(".png"));
+        assert_eq!(
+            image_path(&movie, db::ImageKind::Logo).as_deref(),
+            Some("https://img.example/logo.png"),
+            "an NFO link fills a kind with no local file"
+        );
+
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        let again = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        assert_eq!(image_path(&again, db::ImageKind::Primary).unwrap(), poster);
+
+        // A changed poster is a new copy, so a new image row and tag.
+        std::fs::write(
+            dir.path()
+                .join("Films/Some Film-poster.jpg"),
+            b"poster-2 longer",
+        )
+        .unwrap();
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        let changed = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        let new_poster = image_path(&changed, db::ImageKind::Primary).unwrap();
+        assert_ne!(new_poster, poster);
+        assert_eq!(std::fs::read(&new_poster).unwrap(), b"poster-2 longer");
+    }
+
+    #[tokio::test]
+    async fn series_season_and_episode_artwork() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Show/Season 01/Show - S01E01.mkv", b"fake"),
+                ("Show/Season 01/Show - S01E01-thumb.jpg", b"thumb"),
+                ("Show/poster.jpg", b"series-poster"),
+                ("Show/fanart.jpg", b"series-fanart"),
+                ("Show/season01-poster.jpg", b"season-poster"),
+            ],
+        );
+        let (ctx, _guard, _tmdb, addon, _) =
+            scan_local(dir.path(), "episode", serde_json::json!({})).await;
+        let read = |path: Option<String>| std::fs::read(path.unwrap()).unwrap();
+
+        let series = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        assert_eq!(
+            read(image_path(&series, db::ImageKind::Primary)),
+            b"series-poster"
+        );
+        assert_eq!(
+            read(image_path(&series, db::ImageKind::Backdrop)),
+            b"series-fanart"
+        );
+
+        let season = addon
+            .get_children(&series, &ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert_eq!(season.title, "Season 1");
+        assert_eq!(
+            read(image_path(&season, db::ImageKind::Primary)),
+            b"season-poster"
+        );
+        let season_patch = addon
+            .meta_fetch(&season, &ctx, &Default::default())
+            .await
+            .unwrap()
+            .expect("season meta");
+        assert_eq!(
+            read(image_path(&season_patch, db::ImageKind::Primary)),
+            b"season-poster"
+        );
+
+        let episode = addon
+            .get_children(&season, &ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .remove(0);
+        assert_eq!(read(image_path(&episode, db::ImageKind::Primary)), b"thumb");
+    }
+
+    #[tokio::test]
+    async fn unused_artwork_copies_are_collected() {
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let art_dir = local_meta::local_art_dir(
+            &ctx.config
+                .data_dir,
+        );
+        std::fs::create_dir_all(&art_dir).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        let write = |name: &str, aged: bool| {
+            let path = art_dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            if aged {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(old)
+                    .unwrap();
+            }
+            path
+        };
+        let referenced = write("referenced.jpg", true);
+        let stale = write("stale.jpg", true);
+        let fresh = write("fresh.jpg", false);
+
+        let media_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO media (id, title, kind, created_at, updated_at) \
+             VALUES (?, 'stub', 'movie', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+        )
+        .bind(media_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        db::MediaImage::save(
+            &ctx.db,
+            media_id,
+            db::ImageKind::Primary,
+            referenced
+                .to_str()
+                .unwrap(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let deleted = local_meta::collect_art_garbage(
+            &ctx.db,
+            &ctx.config
+                .data_dir,
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 1);
+        assert!(referenced.exists());
+        assert!(!stale.exists());
+        assert!(
+            fresh.exists(),
+            "a copy a running scan may have just made is kept"
+        );
     }
 
     #[tokio::test]

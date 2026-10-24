@@ -2,6 +2,7 @@
 //! sidecar files next to them: Kodi and Emby/Jellyfin NFOs, and Plex
 //! `.plexmatch` hints.
 
+pub mod artwork;
 pub mod nfo;
 pub mod plexmatch;
 
@@ -184,10 +185,47 @@ pub struct LocalMeta {
     pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "SidecarIds::is_empty")]
     pub ids: SidecarIds,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<LocalImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub season_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub season_images: Vec<LocalImage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series: Option<Box<LocalMeta>>,
+}
+
+/// One piece of artwork, at most one per kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalImage {
+    pub kind: db::ImageKind,
+    /// Where it is served from: a copy in the local-art store, or a remote
+    /// URL an NFO links to.
+    pub path: String,
+    /// The image file the copy was made from, with its size and modified
+    /// time, so an unchanged file is not copied again. `None` for a URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+impl LocalMeta {
+    /// Every image this metadata holds, its series' and season's included.
+    pub fn all_images(&self) -> impl Iterator<Item = &LocalImage> {
+        self.images
+            .iter()
+            .chain(
+                self.season_images
+                    .iter(),
+            )
+            .chain(
+                self.series
+                    .iter()
+                    .flat_map(|s| {
+                        s.images
+                            .iter()
+                    }),
+            )
+    }
 }
 
 impl LocalMeta {
@@ -273,6 +311,29 @@ impl LocalMeta {
         if !relations.is_empty() {
             media.relations = Some(relations);
         }
+        if !self
+            .images
+            .is_empty()
+        {
+            media.images = db::MediaImages::from(
+                self.images
+                    .iter()
+                    .map(|image| db::MediaImage {
+                        id: Uuid::new_v4(),
+                        media_id: media.id,
+                        image_type: image
+                            .kind
+                            .to_string(),
+                        image_index: 0,
+                        path: image
+                            .path
+                            .clone(),
+                        width: None,
+                        height: None,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
     }
 }
 
@@ -297,6 +358,116 @@ fn name_relation(
             ..Default::default()
         },
     )
+}
+
+/// Where copies of sidecar artwork are kept, next to user uploads
+/// (`meta/library`). `MediaImage::sync_from_media` lets an addon replace an
+/// image stored here, unlike an upload.
+pub fn local_art_dir(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir
+        .join("meta")
+        .join(db::LOCAL_ART_DIR)
+}
+
+/// Copies the image `bytes` read from `source` (whose extension is kept) into
+/// `art_dir` under their SHA-256, and returns the copy's path. A changed image
+/// gets a new path, so its `media_images` row, image tag and resized copies
+/// are all new too.
+pub async fn store_art(
+    art_dir: &std::path::Path,
+    source: &str,
+    bytes: &[u8],
+) -> std::io::Result<String> {
+    use sha2::Digest;
+
+    let ext = match source
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.to_ascii_lowercase())
+    {
+        // Kodi's `.tbn` is a JPEG.
+        Some(ext) if ext != "tbn" && artwork::is_image_ext(&ext) => ext,
+        _ => "jpg".to_string(),
+    };
+    let hash = sha2::Sha256::digest(bytes);
+    let path = art_dir.join(format!("{hash:x}.{ext}"));
+    if !tokio::fs::try_exists(&path)
+        .await
+        .unwrap_or(false)
+    {
+        tokio::fs::create_dir_all(art_dir).await?;
+        let tmp = path.with_extension(format!("{ext}.tmp"));
+        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::rename(&tmp, &path).await?;
+    }
+    Ok(path
+        .to_string_lossy()
+        .into_owned())
+}
+
+/// Deletes copies in the local-art store that neither a `media_images` row nor
+/// any opendal file's `local_meta` refers to. A copy younger than an hour is
+/// kept, since a scan running now may have just made it.
+pub async fn collect_art_garbage(
+    db: &sqlx::SqlitePool,
+    data_dir: &std::path::Path,
+) -> anyhow::Result<usize> {
+    let art_dir = local_art_dir(data_dir);
+    let mut entries = match tokio::fs::read_dir(&art_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let pattern = format!("%{}%", db::LOCAL_ART_DIR);
+    let mut referenced: std::collections::HashSet<String> =
+        sqlx::query_scalar("SELECT path FROM media_images WHERE path LIKE ?")
+            .bind(&pattern)
+            .fetch_all(db)
+            .await?
+            .into_iter()
+            .collect();
+    let metas: Vec<sqlx::types::Json<LocalMeta>> = sqlx::query_scalar(
+        "SELECT local_meta FROM opendal_files WHERE local_meta LIKE ?",
+    )
+    .bind(&pattern)
+    .fetch_all(db)
+    .await?;
+    for meta in &metas {
+        referenced.extend(
+            meta.all_images()
+                .map(|i| {
+                    i.path
+                        .clone()
+                }),
+        );
+    }
+
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    let mut deleted = 0;
+    while let Some(entry) = entries
+        .next_entry()
+        .await?
+    {
+        let path = entry.path();
+        if referenced.contains(
+            path.to_string_lossy()
+                .as_ref(),
+        ) {
+            continue;
+        }
+        let young = entry
+            .metadata()
+            .await
+            .and_then(|m| m.modified())
+            .is_ok_and(|modified| modified > cutoff);
+        if !young
+            && tokio::fs::remove_file(&path)
+                .await
+                .is_ok()
+        {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 /// The UTF-8 text of a sidecar, without a byte order mark.
