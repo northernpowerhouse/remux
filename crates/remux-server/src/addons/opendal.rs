@@ -1543,14 +1543,29 @@ fn local_series_title(rel_components: &[&str]) -> Option<String> {
     let [series_dir, _, ..] = rel_components else {
         return None;
     };
-    let parsed = hunch::hunch(series_dir);
+    let series_dir = without_id_tags(series_dir);
+    let parsed = hunch::hunch(&series_dir);
     Some(
         parsed
             .title()
             .filter(|t| !t.is_empty())
-            .unwrap_or(series_dir)
+            .unwrap_or(&series_dir)
             .to_string(),
     )
+}
+
+/// `name` without its Jellyfin `[tmdbid-…]` and Plex `{tmdb-…}` id tags, for
+/// title parsing, which would otherwise keep a tag that follows no year.
+fn without_id_tags(name: &str) -> String {
+    static RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\s*(?:\[(?:tmdb|imdb|tvdb)(?:id)?-[^\]]*\]|\{(?:tmdb|imdb|tvdb)(?:id)?-[^}]*\})",
+        )
+        .unwrap()
+    });
+    RE.replace_all(name, "")
+        .trim()
+        .to_string()
 }
 
 /// Directory part of a stored path (`""` for a bare name).
@@ -1873,7 +1888,8 @@ async fn scan_addon(
                 let stem = stem_without_ext(&name);
                 let (base_stem, _, _, _) = split_subtitle_stem(&stem);
                 let jellyfin_ids = db::ExternalIds::from_path(&path);
-                let parsed = hunch::hunch(&base_stem);
+                let title_stem = without_id_tags(&base_stem);
+                let parsed = hunch::hunch(&title_stem);
                 let is_tv = media_kind == "episode";
 
                 let (season, episode) = if is_tv {
@@ -1895,7 +1911,7 @@ async fn scan_addon(
                     .map(|y| y as i64);
                 let title_str = parsed
                     .title()
-                    .unwrap_or(base_stem.as_str())
+                    .unwrap_or(title_stem.as_str())
                     .to_string();
 
                 let matched = match_file(
@@ -2131,7 +2147,8 @@ async fn scan_addon(
                     (Some(title), None, None, track_number, None, None)
                 }
                 "episode" => {
-                    let parsed = hunch::hunch(&stem);
+                    let title_stem = without_id_tags(&stem);
+                    let parsed = hunch::hunch(&title_stem);
                     let (season, episode) = year_season_episode(&stem)
                         .map(|(s, e)| (Some(s), Some(e)))
                         .unwrap_or((
@@ -2158,12 +2175,12 @@ async fn scan_addon(
                             (t.to_string(), year)
                         }
                         None if path_components.len() >= 2 => {
-                            let series_dir = path_components[0];
-                            let dir_parsed = hunch::hunch(series_dir);
+                            let series_dir = without_id_tags(path_components[0]);
+                            let dir_parsed = hunch::hunch(&series_dir);
                             let title = dir_parsed
                                 .title()
                                 .filter(|t| !t.is_empty())
-                                .unwrap_or(series_dir)
+                                .unwrap_or(&series_dir)
                                 .to_string();
                             let year = dir_parsed
                                 .year()
@@ -2174,7 +2191,7 @@ async fn scan_addon(
                             let year = parsed
                                 .year()
                                 .map(|y| y as i64);
-                            (stem.clone(), year)
+                            (title_stem.clone(), year)
                         }
                     };
 
@@ -2221,12 +2238,13 @@ async fn scan_addon(
                 }
                 _ => {
                     // movie
-                    let parsed = hunch::hunch(&stem);
+                    let title_stem = without_id_tags(&stem);
+                    let parsed = hunch::hunch(&title_stem);
                     let year = parsed
                         .year()
                         .map(|y| y as i64);
                     let clean_title =
-                        movie_title_from_stem(&stem, parsed.title(), year);
+                        movie_title_from_stem(&title_stem, parsed.title(), year);
 
                     let matched = match_file(
                         ctx,
@@ -5652,6 +5670,55 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn plex_brace_ids_in_paths_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Bleach {tvdb-74796}/Season 01/Bleach - S01E01.mkv", b"fake"),
+                (
+                    "Bleach {tvdb-74796}/Season 01/S01E02 - The Shinigami.mkv",
+                    b"fake",
+                ),
+            ],
+        );
+        let tmdb = httpmock::MockServer::start();
+        tmdb.mock(|when, then| {
+            when.path("/find/74796")
+                .query_param("external_source", "tvdb_id");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "tv_results": [{"id": 30984, "name": "Bleach"}],
+                    "movie_results": []
+                }));
+        });
+        register_all_shows(&tmdb);
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "episode").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let rows: Vec<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT imdb_id, title, episode FROM opendal_files \
+             WHERE addon_id = ? ORDER BY episode",
+        )
+        .bind(db_addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (Some("tt0434665".into()), Some("Bleach".into()), Some(1)),
+                (Some("tt0434665".into()), Some("Bleach".into()), Some(2)),
+            ],
+            "the id tag is neither missed nor kept in the series title"
+        );
+    }
+
     // A show's tmdb id sits on every file in its folder. Under a movie addon it
     // goes to the movie endpoint and 404s; that miss must be asked once per
     // scan, not once per file.
@@ -7462,6 +7529,30 @@ mod tests {
             .fetch_one(&ctx.db)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn titles_ignore_plex_id_tags() {
+        for (stem, expected) in [
+            ("The Matrix (1999) {tmdb-603}", "The Matrix"),
+            ("The Matrix {imdb-tt0133093}", "The Matrix"),
+            ("Some Film [tmdbid-603]", "Some Film"),
+        ] {
+            let stem = without_id_tags(stem);
+            let parsed = hunch::hunch(&stem);
+            let year = parsed
+                .year()
+                .map(|y| y as i64);
+            assert_eq!(
+                movie_title_from_stem(&stem, parsed.title(), year),
+                expected,
+                "{stem}"
+            );
+        }
+        assert_eq!(
+            local_series_title(&["Show (2005) {tvdb-81189}", "S01E01.mkv"]).as_deref(),
+            Some("Show")
+        );
     }
 
     #[test]

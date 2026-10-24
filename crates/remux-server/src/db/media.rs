@@ -1124,14 +1124,29 @@ impl ExternalIds {
     /// `Movies/The Matrix (1999) [tmdbid-603]/The Matrix.mkv` → `tmdb: Some(603)`.
     /// Supported providers (case-insensitive): tmdbid/tmdb, imdbid/imdb, tvdbid/tvdb.
     pub fn from_path(path: &str) -> Self {
+        // Jellyfin's `[tmdbid-603]` and Plex's `{tmdb-603}`, each closed by its
+        // own bracket.
         static RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"(?i)\[(tmdb(?:id)?|imdb(?:id)?|tvdb(?:id)?)-([^\]]+)\]")
-                .unwrap()
+            Regex::new(
+                r"(?i)\[(tmdb(?:id)?|imdb(?:id)?|tvdb(?:id)?)-([^\]]+)\]|\{(tmdb(?:id)?|imdb(?:id)?|tvdb(?:id)?)-([^}]+)\}",
+            )
+            .unwrap()
         });
         let mut result = Self::default();
         for cap in RE.captures_iter(path) {
-            let provider = cap[1].to_ascii_lowercase();
-            let value = cap[2]
+            let (Some(provider), Some(value)) = (
+                cap.get(1)
+                    .or_else(|| cap.get(3)),
+                cap.get(2)
+                    .or_else(|| cap.get(4)),
+            ) else {
+                continue;
+            };
+            let provider = provider
+                .as_str()
+                .to_ascii_lowercase();
+            let value = value
+                .as_str()
                 .trim()
                 .to_string();
             match provider.as_str() {
@@ -10443,6 +10458,34 @@ mod tests {
     fn from_path_invalid_numeric_id_is_empty() {
         let ids = ExternalIds::from_path("[tmdbid-notanumber]/movie.mkv");
         assert!(ids.is_empty());
+    }
+
+    #[test]
+    fn from_path_plex_braces() {
+        let ids = ExternalIds::from_path(
+            "/movies/The Matrix (1999) {imdb-tt0133093}/The Matrix (1999) {tmdb-603}.mkv",
+        );
+        assert_eq!(
+            ids.imdb
+                .as_ref()
+                .map(|s| s.as_str()),
+            Some("tt0133093")
+        );
+        assert_eq!(ids.tmdb, Some(603));
+
+        let ids =
+            ExternalIds::from_path("/tv/Show (2005) {TVDB-81189}/Season 01/S01E01.mkv");
+        assert_eq!(ids.tvdb, Some(81189));
+    }
+
+    #[test]
+    fn from_path_needs_matching_brackets() {
+        assert!(ExternalIds::from_path("Film [tmdb-603}.mkv").is_empty());
+        assert!(ExternalIds::from_path("Film {tmdb-603].mkv").is_empty());
+        assert!(
+            ExternalIds::from_path("Film {edition-Director's Cut}.mkv").is_empty(),
+            "other Plex tags are not ids"
+        );
     }
 
     #[test]
