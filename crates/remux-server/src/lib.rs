@@ -47,6 +47,7 @@ mod conversions;
 pub mod device_profile;
 mod errors;
 mod keyed_lock;
+mod local_meta;
 pub mod sdks {
     pub use remux_sdks::*;
 }

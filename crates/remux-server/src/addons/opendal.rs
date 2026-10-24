@@ -14,11 +14,16 @@ use tracing::{debug, info, warn};
 use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonOption, AddonOptionType,
     AddonPreset, AddonPresetRegistration, AddonSelectOption, CatalogAddon, CatalogInfo,
-    IndexAddon, MediaKind, ProgressReporter, ResourceType, StreamAddon, SubtitleAddon,
-    SubtitleInfo, SubtitleQuery, TreeAddon,
+    IndexAddon, MediaKind, MetaAddon, ProgressReporter, ResourceType, StreamAddon,
+    SubtitleAddon, SubtitleInfo, SubtitleQuery, TreeAddon,
 };
 use crate::{
-    AppContext, addons::Addon, common, db, sdks, sdks::CachedEndpoint,
+    AppContext,
+    addons::Addon,
+    common, db,
+    local_meta::{self, LocalMeta, SidecarFormat},
+    sdks,
+    sdks::CachedEndpoint,
     services::MediaResolveService,
 };
 
@@ -82,6 +87,15 @@ impl LocalMetadataMode {
             })
             .unwrap_or_default()
     }
+
+    /// The configured mode, which music libraries ignore.
+    fn for_kind(media_kind: &str, cfg: &serde_json::Value) -> Self {
+        if media_kind == "track" {
+            Self::Off
+        } else {
+            Self::from_cfg(cfg)
+        }
+    }
 }
 
 fn local_metadata_option() -> AddonOption {
@@ -108,6 +122,36 @@ fn local_metadata_option() -> AddonOption {
                     value: LocalMetadataMode::Fallback.to_string(),
                 },
             ],
+        },
+    }
+}
+
+fn sidecar_format_option() -> AddonOption {
+    AddonOption {
+        id: "sidecar_format".to_string(),
+        name: "Sidecar Metadata".to_string(),
+        description: Some(
+            "Where unmatched files get their titles, plots, dates and genres: the NFO \
+             or .plexmatch files next to them."
+                .to_string(),
+        ),
+        required: false,
+        default: Some(serde_json::Value::String(
+            SidecarFormat::default().to_string(),
+        )),
+        kind: AddonOptionType::Select {
+            options: [
+                (SidecarFormat::Kodi, "Kodi (NFO)"),
+                (SidecarFormat::Jellyfin, "Emby/Jellyfin (NFO)"),
+                (SidecarFormat::Plex, "Plex (.plexmatch)"),
+                (SidecarFormat::None, "None"),
+            ]
+            .into_iter()
+            .map(|(format, label)| AddonSelectOption {
+                label: label.to_string(),
+                value: format.to_string(),
+            })
+            .collect(),
         },
     }
 }
@@ -167,6 +211,27 @@ pub(crate) fn is_local_only(media: &db::Media) -> bool {
                 .as_deref()
                 .is_some_and(|id| id.starts_with("opendal:"))
     })
+}
+
+/// The part of a file's stored sidecar metadata that describes an item of
+/// `kind`: the file's own for a movie or episode, its series' or season's
+/// otherwise. `None` when the sidecars say nothing about it.
+fn item_meta(meta: LocalMeta, kind: &db::MediaKind) -> Option<LocalMeta> {
+    let item = match kind {
+        db::MediaKind::Series => meta
+            .series
+            .map(|s| *s)?,
+        db::MediaKind::Season => LocalMeta {
+            title: meta.season_title,
+            ..Default::default()
+        },
+        _ => LocalMeta {
+            series: None,
+            season_title: None,
+            ..meta
+        },
+    };
+    (!item.is_empty()).then_some(item)
 }
 
 /// Path components of `rel_path` below `scan_dir`, the configured directory it
@@ -266,6 +331,7 @@ impl AddonPreset for OpendalLocalPreset {
                 AddonMetadata::simple_resource(ResourceType::Stream),
                 AddonMetadata::simple_resource(ResourceType::Catalog),
                 AddonMetadata::simple_resource(ResourceType::Subtitles),
+                AddonMetadata::simple_resource(ResourceType::Meta),
             ],
             supported_types: vec![
                 MediaKind::Movie,
@@ -292,6 +358,7 @@ impl AddonPreset for OpendalLocalPreset {
                     kind: AddonOptionType::StringList,
                 },
                 local_metadata_option(),
+                sidecar_format_option(),
             ],
         }
     }
@@ -320,6 +387,7 @@ impl AddonPreset for OpendalLocalPreset {
             operator: Arc::new(operator),
             root: first,
             backend: "local".to_string(),
+            local_mode: LocalMetadataMode::for_kind(&media_kind, cfg),
             media_kind,
         });
         Ok(AddonCapabilities {
@@ -328,6 +396,7 @@ impl AddonPreset for OpendalLocalPreset {
             stream: Some(addon.clone()),
             tree: Some(addon.clone()),
             index: Some(addon.clone()),
+            meta: Some(addon.clone()),
             subtitle: Some(addon),
             ..Default::default()
         })
@@ -360,6 +429,7 @@ impl AddonPreset for OpendalWebdavPreset {
                 AddonMetadata::simple_resource(ResourceType::Stream),
                 AddonMetadata::simple_resource(ResourceType::Catalog),
                 AddonMetadata::simple_resource(ResourceType::Subtitles),
+                AddonMetadata::simple_resource(ResourceType::Meta),
             ],
             supported_types: vec![
                 MediaKind::Movie,
@@ -423,6 +493,7 @@ impl AddonPreset for OpendalWebdavPreset {
                     kind: AddonOptionType::Boolean,
                 },
                 local_metadata_option(),
+                sidecar_format_option(),
             ],
         }
     }
@@ -462,6 +533,7 @@ impl AddonPreset for OpendalWebdavPreset {
             operator: Arc::new(operator),
             root: endpoint.to_string(),
             backend: "webdav".to_string(),
+            local_mode: LocalMetadataMode::for_kind(&media_kind, cfg),
             media_kind,
         });
         Ok(AddonCapabilities {
@@ -470,6 +542,7 @@ impl AddonPreset for OpendalWebdavPreset {
             stream: Some(addon.clone()),
             tree: Some(addon.clone()),
             index: Some(addon.clone()),
+            meta: Some(addon.clone()),
             subtitle: Some(addon),
             ..Default::default()
         })
@@ -490,6 +563,7 @@ pub struct OpendalAddon {
     root: String,
     backend: String,
     media_kind: String,
+    local_mode: LocalMetadataMode,
 }
 
 #[derive(sqlx::FromRow)]
@@ -505,6 +579,8 @@ pub struct OpendalFile {
     pub size: Option<i64>,
     #[sqlx(default)]
     pub probe_data: Option<sqlx::types::Json<crate::api::MediaSourceInfo>>,
+    #[sqlx(default)]
+    pub local_meta: Option<sqlx::types::Json<LocalMeta>>,
 }
 
 impl OpendalAddon {
@@ -538,28 +614,87 @@ impl OpendalAddon {
         file_kind: &str,
         kind: db::MediaKind,
     ) -> Result<Vec<db::Media>> {
-        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-            "SELECT local_key, MIN(title) FROM opendal_files \
-             WHERE addon_id = ? AND media_kind = ? AND imdb_id IS NULL AND local_key IS NOT NULL \
-             GROUP BY local_key",
-        )
-        .bind(self.addon_id)
-        .bind(file_kind)
-        .fetch_all(&ctx.db)
-        .await?;
+        // Every episode row of a series carries the same series metadata, so
+        // any one of them will do.
+        let rows: Vec<(String, Option<String>, Option<sqlx::types::Json<LocalMeta>>)> =
+            sqlx::query_as(
+                "SELECT local_key, MIN(title), MAX(local_meta) FROM opendal_files \
+                 WHERE addon_id = ? AND media_kind = ? AND imdb_id IS NULL AND local_key IS NOT NULL \
+                 GROUP BY local_key",
+            )
+            .bind(self.addon_id)
+            .bind(file_kind)
+            .fetch_all(&ctx.db)
+            .await?;
         Ok(rows
             .into_iter()
-            .map(|(key, title)| db::Media {
-                id: common::stable_media_uuid(&kind, &key),
-                title: title.unwrap_or_default(),
-                kind: kind.clone(),
-                external_ids: db::ExternalIds {
-                    custom_stremio_id: Some(key),
+            .map(|(key, title, meta)| {
+                let mut media = db::Media {
+                    id: common::stable_media_uuid(&kind, &key),
+                    title: title.unwrap_or_default(),
+                    kind: kind.clone(),
+                    external_ids: db::ExternalIds {
+                        custom_stremio_id: Some(key),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
+                };
+                if let Some(meta) = meta.and_then(|m| item_meta(m.0, &kind)) {
+                    meta.apply_to(&mut media);
+                }
+                media
             })
             .collect())
+    }
+
+    /// The sidecar metadata of a movie, series, season or episode this addon
+    /// indexed under a local identity.
+    async fn local_meta_of(
+        &self,
+        ctx: &AppContext,
+        media: &db::Media,
+    ) -> Result<Option<LocalMeta>> {
+        let (key, season, episode) = match media.kind {
+            db::MediaKind::Movie | db::MediaKind::Series => {
+                (self.own_local_key(media), None, None)
+            }
+            db::MediaKind::Season => (
+                media
+                    .grandparent
+                    .as_deref()
+                    .and_then(|gp| self.own_local_key(gp)),
+                media.idx,
+                None,
+            ),
+            db::MediaKind::Episode => (
+                media
+                    .grandparent
+                    .as_deref()
+                    .and_then(|gp| self.own_local_key(gp)),
+                media.parent_idx,
+                media.idx,
+            ),
+            _ => return Ok(None),
+        };
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        let meta: Option<sqlx::types::Json<LocalMeta>> = sqlx::query_scalar(
+            "SELECT local_meta FROM opendal_files \
+             WHERE addon_id = ? AND local_key = ? AND media_kind IN ('movie', 'episode') \
+               AND local_meta IS NOT NULL \
+               AND (? IS NULL OR season = ?) AND (? IS NULL OR episode = ?) \
+             ORDER BY path LIMIT 1",
+        )
+        .bind(self.addon_id)
+        .bind(key)
+        .bind(season)
+        .bind(season)
+        .bind(episode)
+        .bind(episode)
+        .fetch_optional(&ctx.db)
+        .await?;
+        Ok(meta.and_then(|m| item_meta(m.0, &media.kind)))
     }
 }
 
@@ -586,13 +721,15 @@ impl AddonKind for OpendalAddon {
             types: vec![],
             id_prefixes: None,
         };
-        Ok(Some((
-            vec![
-                make_ref(ResourceType::Stream),
-                make_ref(ResourceType::Catalog),
-            ],
-            vec![media_type],
-        )))
+        let mut resources = vec![
+            make_ref(ResourceType::Stream),
+            make_ref(ResourceType::Catalog),
+        ];
+        // Only items indexed under a local identity have metadata here.
+        if self.local_mode != LocalMetadataMode::Off {
+            resources.push(make_ref(ResourceType::Meta));
+        }
+        Ok(Some((resources, vec![media_type])))
     }
 }
 
@@ -1181,6 +1318,37 @@ impl StreamAddon for OpendalAddon {
 }
 
 #[async_trait]
+impl MetaAddon for OpendalAddon {
+    async fn supports(&self, media: &db::Media) -> bool {
+        let owner = match media.kind {
+            db::MediaKind::Movie | db::MediaKind::Series => Some(media),
+            db::MediaKind::Season | db::MediaKind::Episode => media
+                .grandparent
+                .as_deref(),
+            _ => None,
+        };
+        owner.is_some_and(|m| {
+            is_local_only(m)
+                && self
+                    .own_local_key(m)
+                    .is_some()
+        })
+    }
+
+    async fn meta_fetch(
+        &self,
+        media: &db::Media,
+        ctx: &AppContext,
+        _config: &crate::api::ServerConfiguration,
+    ) -> Result<Option<db::Media>> {
+        Ok(self
+            .local_meta_of(ctx, media)
+            .await?
+            .map(|meta| meta.patch_for(media)))
+    }
+}
+
+#[async_trait]
 impl TreeAddon for OpendalAddon {
     fn supports(&self, root: &db::Media) -> bool {
         self.media_kind == "episode"
@@ -1201,11 +1369,12 @@ impl TreeAddon for OpendalAddon {
                 let Some((column, series_key)) = self.files_key(root) else {
                     return Ok(None);
                 };
-                let season_nums: Vec<i64> = sqlx::query_scalar(&format!(
-                    "SELECT DISTINCT season FROM opendal_files \
+                let season_nums: Vec<(i64, Option<String>)> = sqlx::query_as(&format!(
+                    "SELECT season, MAX(json_extract(local_meta, '$.season_title')) \
+                     FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' \
                        AND {column} = ? AND season IS NOT NULL \
-                     ORDER BY season"
+                     GROUP BY season ORDER BY season"
                 ))
                 .bind(self.addon_id)
                 .bind(series_key)
@@ -1219,12 +1388,12 @@ impl TreeAddon for OpendalAddon {
                 let gp_box = Some(Arc::new(root.clone()));
                 let seasons = season_nums
                     .into_iter()
-                    .map(|s| db::Media {
+                    .map(|(s, title)| db::Media {
                         id: common::get_stable_uuid(format!(
                             "season:{}:{}",
                             series_key, s
                         )),
-                        title: crate::addons::season_title(s),
+                        title: title.unwrap_or_else(|| crate::addons::season_title(s)),
                         kind: db::MediaKind::Season,
                         parent_id: Some(root.id),
                         grandparent_id: Some(root.id),
@@ -1276,7 +1445,7 @@ impl TreeAddon for OpendalAddon {
 
                 let files: Vec<OpendalFile> = sqlx::query_as(&format!(
                     "SELECT path, name, title, imdb_id, season, episode, \
-                            track_number, year, size \
+                            track_number, year, size, local_meta \
                      FROM opendal_files \
                      WHERE addon_id = ? AND media_kind = 'episode' \
                        AND {column} = ? AND season = ? \
@@ -1311,7 +1480,7 @@ impl TreeAddon for OpendalAddon {
                                     .clone(),
                             }
                         };
-                        Some(db::Media {
+                        let mut episode = db::Media {
                             id: common::get_stable_uuid(format!(
                                 "episode:{}:{}:{}",
                                 series_key, season_num, ep_num
@@ -1333,7 +1502,12 @@ impl TreeAddon for OpendalAddon {
                                 ..Default::default()
                             }),
                             ..Default::default()
-                        })
+                        };
+                        if let Some(meta) = f.local_meta {
+                            meta.0
+                                .apply_to(&mut episode);
+                        }
+                        Some(episode)
                     })
                     .collect();
 
@@ -1531,10 +1705,11 @@ async fn scan_addon(
         .preset
         .kind
         == "opendal-local";
-    let local_mode = if media_kind == "track" {
-        LocalMetadataMode::Off
+    let local_mode = LocalMetadataMode::for_kind(&media_kind, cfg);
+    let sidecar_format = if local_mode == LocalMetadataMode::Off {
+        SidecarFormat::None
     } else {
-        LocalMetadataMode::from_cfg(cfg)
+        SidecarFormat::from_cfg(cfg)
     };
 
     info!(addon = %addon.name, kind = %addon.preset.kind, media_kind, %local_mode, "opendal: scanning");
@@ -1608,6 +1783,7 @@ async fn scan_addon(
     };
     let mut probe_jobs: Vec<ProbeJob> = Vec::new();
     let mut path_id_memo = PathIdMemo::default();
+    let scan_started = Utc::now().naive_utc();
 
     // Debrid-style WebDAV shares only ever add folders, so a folder that has not
     // changed since it was indexed is not walked again. This is opt-in
@@ -1628,6 +1804,8 @@ async fn scan_addon(
         } else {
             path_prefix.as_str()
         };
+        let mut sidecars = SidecarIndex::default();
+        let mut local_rows: Vec<LocalRow> = Vec::new();
         let (mut single, mut lister) = open_scan_source(
             &operator,
             &list_from,
@@ -1786,6 +1964,11 @@ async fn scan_addon(
 
                 debug!(path, "opendal: indexed subtitle");
                 upserted += 1;
+                continue;
+            }
+
+            if sidecar_format != SidecarFormat::None && is_sidecar_name(&name, &ext) {
+                sidecars.insert(&entry_rel);
                 continue;
             }
 
@@ -2001,8 +2184,9 @@ async fn scan_addon(
                     {
                         clean_title
                     } else if local_mode == LocalMetadataMode::Off
-                        || season.is_none()
-                        || episode.is_none()
+                        // Sidecars may still number the episode.
+                        || ((season.is_none() || episode.is_none())
+                            && sidecar_format == SidecarFormat::None)
                     {
                         debug!(path, title = %clean_title, "opendal: no IMDB id, skipping");
                         // Not seen, so a row an earlier scan stored under a
@@ -2156,6 +2340,22 @@ async fn scan_addon(
             match insert_result {
                 Ok(_) => {
                     upserted += 1;
+                    if let Some(local_key) = local_key {
+                        local_rows.push(LocalRow {
+                            id: row_id,
+                            series_dir: (media_kind == "episode")
+                                .then(|| series_dir_of(&entry_rel, &list_from))
+                                .flatten(),
+                            rel: entry_rel
+                                .trim_matches('/')
+                                .to_string(),
+                            local_key,
+                            season,
+                            episode,
+                            searched: match_attempted_at
+                                .is_some_and(|at| at >= scan_started),
+                        });
+                    }
                     let unchanged = known_probes
                         .get(&row_id)
                         .is_some_and(|(old_version, has_probe)| {
@@ -2200,6 +2400,24 @@ async fn scan_addon(
                     );
                 }
                 Err(e) => return Err(e.into()),
+            }
+        }
+
+        if local_mode != LocalMetadataMode::Off {
+            let unnumbered = apply_sidecars(
+                ctx,
+                tmdb,
+                addon.id,
+                media_kind == "episode",
+                sidecar_format,
+                &operator,
+                &sidecars,
+                local_rows,
+                &mut path_id_memo,
+            )
+            .await?;
+            if !unnumbered.is_empty() {
+                seen_ids.retain(|id| !unnumbered.contains(id));
             }
         }
     }
@@ -2808,6 +3026,527 @@ async fn match_file(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Sidecar metadata for files indexed under a local identity
+// ---------------------------------------------------------------------------
+
+/// Largest sidecar file that is read.
+const MAX_SIDECAR_BYTES: usize = 1 << 20;
+
+fn is_sidecar_name(name: &str, ext: &str) -> bool {
+    ext == "nfo" || name.eq_ignore_ascii_case(".plexmatch")
+}
+
+/// Sidecar files a scan walked past, by operator-relative path. Lookups ignore
+/// case, as Kodi, Jellyfin and Plex do.
+#[derive(Default)]
+struct SidecarIndex(std::collections::HashMap<String, String>);
+
+impl SidecarIndex {
+    fn insert(&mut self, rel: &str) {
+        let rel = rel.trim_matches('/');
+        self.0
+            .insert(rel.to_lowercase(), rel.to_string());
+    }
+
+    fn find(&self, dir: &str, name: &str) -> Option<&str> {
+        self.0
+            .get(&join_rel(dir, name).to_lowercase())
+            .map(String::as_str)
+    }
+}
+
+fn join_rel(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// Operator-relative path of the series folder of an episode at `rel_path`:
+/// the first folder below the scanned directory. `None` for a file directly in
+/// that directory.
+fn series_dir_of(rel_path: &str, scan_dir: &str) -> Option<String> {
+    let below = scan_components(rel_path, scan_dir).len();
+    let all: Vec<&str> = rel_path
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    (below >= 2).then(|| all[..=all.len() - below].join("/"))
+}
+
+/// A movie or episode file this scan indexed under a local identity.
+struct LocalRow {
+    id: Uuid,
+    /// Operator-relative path of the file.
+    rel: String,
+    series_dir: Option<String>,
+    local_key: String,
+    season: Option<i64>,
+    episode: Option<i64>,
+    /// This scan looked the file up on TMDB (it was not throttled).
+    searched: bool,
+}
+
+/// Reads and parses sidecars, each file once per scan.
+struct SidecarReader<'a> {
+    operator: &'a opendal::Operator,
+    index: &'a SidecarIndex,
+    nfo: std::collections::HashMap<String, Arc<Vec<local_meta::nfo::Nfo>>>,
+    plexmatch: std::collections::HashMap<String, Arc<local_meta::plexmatch::PlexMatch>>,
+}
+
+impl SidecarReader<'_> {
+    async fn read(&self, rel: &str) -> Option<Vec<u8>> {
+        match self
+            .operator
+            .read(rel)
+            .await
+        {
+            Ok(buf) if buf.len() <= MAX_SIDECAR_BYTES => Some(buf.to_vec()),
+            Ok(_) => {
+                debug!(path = rel, "opendal: sidecar too large, ignoring");
+                None
+            }
+            Err(e) => {
+                warn!(path = rel, error = %e, "opendal: failed to read sidecar");
+                None
+            }
+        }
+    }
+
+    async fn nfo(
+        &mut self,
+        dir: &str,
+        name: &str,
+    ) -> Option<Arc<Vec<local_meta::nfo::Nfo>>> {
+        let rel = self
+            .index
+            .find(dir, name)?
+            .to_string();
+        if let Some(docs) = self
+            .nfo
+            .get(&rel)
+        {
+            return Some(docs.clone());
+        }
+        let docs = Arc::new(
+            self.read(&rel)
+                .await
+                .map(|bytes| local_meta::nfo::parse(&bytes))
+                .unwrap_or_default(),
+        );
+        self.nfo
+            .insert(rel, docs.clone());
+        Some(docs)
+    }
+
+    async fn plexmatch(
+        &mut self,
+        dir: &str,
+    ) -> Option<Arc<local_meta::plexmatch::PlexMatch>> {
+        let rel = self
+            .index
+            .find(dir, ".plexmatch")?
+            .to_string();
+        if let Some(pm) = self
+            .plexmatch
+            .get(&rel)
+        {
+            return Some(pm.clone());
+        }
+        let pm = Arc::new(
+            self.read(&rel)
+                .await
+                .map(|bytes| local_meta::plexmatch::parse(&bytes))
+                .unwrap_or_default(),
+        );
+        self.plexmatch
+            .insert(rel, pm.clone());
+        Some(pm)
+    }
+}
+
+/// What the sidecars say about one file: its metadata, the ids of its movie
+/// or series, and its episode numbers.
+struct SidecarFindings {
+    meta: LocalMeta,
+    ids: local_meta::SidecarIds,
+    season: Option<i64>,
+    episode: Option<i64>,
+}
+
+async fn movie_sidecars(
+    reader: &mut SidecarReader<'_>,
+    format: SidecarFormat,
+    row: &LocalRow,
+) -> SidecarFindings {
+    let dir = parent_dir(&row.rel);
+    let stem = stem_without_ext(
+        row.rel
+            .rsplit('/')
+            .next()
+            .unwrap_or_default(),
+    );
+    let mut meta = LocalMeta::default();
+    if format.reads_nfo() {
+        for name in [format!("{stem}.nfo"), "movie.nfo".to_string()] {
+            if let Some(docs) = reader
+                .nfo(dir, &name)
+                .await
+            {
+                if let Some(doc) =
+                    local_meta::nfo::first_of(&docs, local_meta::nfo::NfoKind::Movie)
+                {
+                    meta = doc
+                        .meta
+                        .clone();
+                    break;
+                }
+            }
+        }
+    }
+    SidecarFindings {
+        ids: meta
+            .ids
+            .clone(),
+        meta,
+        season: None,
+        episode: None,
+    }
+}
+
+async fn episode_sidecars(
+    reader: &mut SidecarReader<'_>,
+    format: SidecarFormat,
+    row: &LocalRow,
+) -> SidecarFindings {
+    use local_meta::nfo::{self, NfoKind};
+
+    let dir = parent_dir(&row.rel);
+    let file_name = row
+        .rel
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    let stem = stem_without_ext(file_name);
+    // A season folder below the series folder, as opposed to an episode lying
+    // directly in the series folder.
+    let season_dir = row
+        .series_dir
+        .as_deref()
+        .filter(|series| *series != dir)
+        .map(|_| dir);
+
+    let mut series = LocalMeta::default();
+    let mut episode = LocalMeta::default();
+    let mut season_title = None;
+    let mut season = None;
+    let mut number = None;
+
+    if format.reads_nfo() {
+        let mut named_seasons = Default::default();
+        if let Some(series_dir) = row
+            .series_dir
+            .as_deref()
+        {
+            if let Some(docs) = reader
+                .nfo(series_dir, "tvshow.nfo")
+                .await
+            {
+                if let Some(show) = nfo::first_of(&docs, NfoKind::TvShow) {
+                    series = show
+                        .meta
+                        .clone();
+                    named_seasons = show
+                        .named_seasons
+                        .clone();
+                }
+            }
+        }
+        if let Some(docs) = reader
+            .nfo(dir, &format!("{stem}.nfo"))
+            .await
+        {
+            if let Some(ep) = nfo::episode(&docs) {
+                if series
+                    .title
+                    .is_none()
+                {
+                    series.title = ep
+                        .show_title
+                        .clone();
+                }
+                season = ep.season;
+                number = ep.episode;
+                episode = LocalMeta {
+                    // Ids in an episode NFO are the episode's, not the series'.
+                    ids: Default::default(),
+                    ..ep.meta
+                };
+            }
+        }
+        if format == SidecarFormat::Jellyfin {
+            if let Some(season_dir) = season_dir {
+                if let Some(docs) = reader
+                    .nfo(season_dir, "season.nfo")
+                    .await
+                {
+                    if let Some(doc) = nfo::first_of(&docs, NfoKind::Season) {
+                        season = season.or(doc.season);
+                        season_title = doc
+                            .meta
+                            .title
+                            .clone();
+                    }
+                }
+            }
+        }
+        if season_title.is_none() {
+            season_title = season
+                .or(row.season)
+                .and_then(|s| named_seasons.remove(&s));
+        }
+    }
+
+    if format == SidecarFormat::Plex {
+        let series_pm = match row
+            .series_dir
+            .as_deref()
+        {
+            Some(series_dir) => {
+                reader
+                    .plexmatch(series_dir)
+                    .await
+            }
+            None => None,
+        };
+        let season_pm = match season_dir {
+            Some(season_dir) => {
+                reader
+                    .plexmatch(season_dir)
+                    .await
+            }
+            None => None,
+        };
+        let folder_season = season_pm
+            .as_ref()
+            .and_then(|pm| pm.season);
+        let hint = season_pm
+            .as_ref()
+            .and_then(|pm| pm.episode_for(file_name))
+            .or_else(|| {
+                let series_dir = row
+                    .series_dir
+                    .as_deref()?;
+                let below = row
+                    .rel
+                    .strip_prefix(series_dir)?;
+                series_pm
+                    .as_ref()?
+                    .episode_for(below)
+            });
+        season = hint
+            .and_then(|h| h.season)
+            .or(folder_season);
+        number = hint.map(|h| h.episode);
+        if let Some(pm) = &series_pm {
+            series.title = pm
+                .title
+                .clone();
+            series.ids = pm
+                .ids
+                .clone();
+        }
+    }
+
+    let ids = std::mem::take(&mut series.ids);
+    let meta = LocalMeta {
+        season_title,
+        series: (!series.is_empty()).then(|| Box::new(series)),
+        ..episode
+    };
+    SidecarFindings {
+        meta,
+        ids,
+        season,
+        episode: number,
+    }
+}
+
+/// Applies the sidecars of the files this scan indexed under a local identity:
+/// stores their metadata, numbers episodes the file name couldn't, and moves a
+/// movie or series whose sidecars name a resolvable id to that IMDb id.
+/// Returns the episode rows that still have no season and episode number.
+#[allow(clippy::too_many_arguments)]
+async fn apply_sidecars(
+    ctx: &AppContext,
+    tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
+    addon_id: Uuid,
+    is_tv: bool,
+    format: SidecarFormat,
+    operator: &opendal::Operator,
+    index: &SidecarIndex,
+    rows: Vec<LocalRow>,
+    memo: &mut PathIdMemo,
+) -> Result<Vec<Uuid>> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Ids the previous scan read, so ids that are new since then are looked up
+    // even while the row's TMDB lookup is throttled.
+    let stored_ids: std::collections::HashMap<Uuid, local_meta::SidecarIds> =
+        sqlx::query_as::<_, (Uuid, sqlx::types::Json<LocalMeta>)>(
+            "SELECT id, local_meta FROM opendal_files \
+             WHERE addon_id = ? AND local_key IS NOT NULL AND local_meta IS NOT NULL",
+        )
+        .bind(addon_id)
+        .fetch_all(&ctx.db)
+        .await?
+        .into_iter()
+        .map(|(id, meta)| {
+            let meta = meta.0;
+            let ids = match meta.series {
+                Some(series) => series.ids,
+                None => meta.ids,
+            };
+            (id, ids)
+        })
+        .collect();
+
+    let mut reader = SidecarReader {
+        operator,
+        index,
+        nfo: Default::default(),
+        plexmatch: Default::default(),
+    };
+    let mut resolved: std::collections::HashMap<String, Option<String>> =
+        Default::default();
+    let mut unnumbered = Vec::new();
+
+    for row in &rows {
+        let mut found = if is_tv {
+            episode_sidecars(&mut reader, format, row).await
+        } else {
+            movie_sidecars(&mut reader, format, row).await
+        };
+
+        if !found
+            .ids
+            .is_empty()
+            && !resolved.contains_key(&row.local_key)
+            && (row.searched
+                || stored_ids
+                    .get(&row.id)
+                    .is_none_or(|stored| *stored != found.ids))
+        {
+            let path_ids = found
+                .ids
+                .to_external_ids();
+            let imdb = match tmdb {
+                Some(client) => resolve_path_ids(memo, &path_ids, is_tv, client).await,
+                None => path_ids
+                    .imdb
+                    .map(Into::into),
+            };
+            resolved.insert(
+                row.local_key
+                    .clone(),
+                imdb,
+            );
+        }
+        let matched = resolved
+            .get(&row.local_key)
+            .is_some_and(Option::is_some);
+
+        let season = found
+            .season
+            .or(row.season);
+        let episode = found
+            .episode
+            .or(row.episode);
+        if is_tv && (season.is_none() || episode.is_none()) {
+            unnumbered.push(row.id);
+            continue;
+        }
+        let title = if is_tv {
+            found
+                .meta
+                .series
+                .as_ref()
+                .and_then(|s| {
+                    s.title
+                        .clone()
+                })
+        } else {
+            found
+                .meta
+                .title
+                .clone()
+        };
+        // Stored with the ids, so the next scan can tell when they change.
+        if let Some(series) = found
+            .meta
+            .series
+            .as_mut()
+        {
+            series.ids = found
+                .ids
+                .clone();
+        } else if is_tv
+            && !found
+                .ids
+                .is_empty()
+        {
+            found
+                .meta
+                .series = Some(Box::new(LocalMeta {
+                ids: found
+                    .ids
+                    .clone(),
+                ..Default::default()
+            }));
+        }
+        let meta = (!matched
+            && !found
+                .meta
+                .is_empty())
+        .then(|| sqlx::types::Json(&found.meta));
+        sqlx::query(
+            "UPDATE opendal_files SET local_meta = ?, season = ?, episode = ?, \
+             title = COALESCE(?, title) WHERE id = ?",
+        )
+        .bind(meta)
+        .bind(season)
+        .bind(episode)
+        .bind(title)
+        .bind(row.id)
+        .execute(&ctx.db)
+        .await?;
+    }
+
+    for (local_key, imdb) in resolved {
+        let Some(imdb) = imdb else {
+            continue;
+        };
+        info!(local_key, imdb, "opendal: sidecar id matched a local item");
+        // Also moves the item's subtitles, which carry the same key.
+        sqlx::query(
+            "UPDATE opendal_files SET imdb_id = ?, local_key = NULL, \
+             match_attempted_at = NULL, local_meta = NULL \
+             WHERE addon_id = ? AND local_key = ?",
+        )
+        .bind(&imdb)
+        .bind(addon_id)
+        .bind(&local_key)
+        .execute(&ctx.db)
+        .await?;
+    }
+
+    Ok(unnumbered)
+}
+
 async fn prune_stale_paths(
     ctx: &AppContext,
     addon_id: Uuid,
@@ -3199,6 +3938,13 @@ mod tests {
             root,
             backend: "local".to_string(),
             media_kind: media_kind.to_string(),
+            local_mode: LocalMetadataMode::for_kind(
+                media_kind,
+                db_addon
+                    .preset
+                    .config
+                    .expose(),
+            ),
         };
 
         (addon_kind, db_addon)
@@ -6708,6 +7454,342 @@ mod tests {
             .await
             .unwrap();
         assert!(attempted_at().await > stale, "an old miss is retried");
+    }
+
+    async fn scan_local(
+        dir: &std::path::Path,
+        media_kind: &str,
+        extra: serde_json::Value,
+    ) -> (
+        AppContext,
+        crate::integration_test::TestGuard,
+        httpmock::MockServer,
+        OpendalAddon,
+        Addon,
+    ) {
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, guard) = test_server_with_tmdb(&tmdb).await;
+        let mut cfg = fallback_cfg();
+        if let (Some(cfg), Some(extra)) = (cfg.as_object_mut(), extra.as_object()) {
+            cfg.extend(extra.clone());
+        }
+        let (addon, db_addon) = make_local_addon_with(&ctx, dir, media_kind, cfg).await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        (ctx, guard, tmdb, addon, db_addon)
+    }
+
+    async fn catalog_items(addon: &OpendalAddon, ctx: &AppContext) -> Vec<db::Media> {
+        addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await
+    }
+
+    const SPORTARR_RACE_NFO: &[u8] =
+        b"\xEF\xBB\xBF<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<episodedetails>
+  <title>Singapore Grand Prix - Race</title>
+  <showtitle>Formula 1</showtitle>
+  <season>2026</season>
+  <episode>91</episode>
+  <aired>2026-10-04</aired>
+  <plot>Round 18 at Marina Bay.</plot>
+  <genre>Motorsport</genre>
+  <uniqueid type=\"sportarr\" default=\"true\">ev-174552</uniqueid>
+</episodedetails>";
+
+    #[tokio::test]
+    async fn kodi_sidecars_describe_an_unmatched_series() {
+        let dir = tempfile::tempdir().unwrap();
+        let race = "Formula 1/Season 2026/Formula 1 - S2026E91 - Singapore Grand Prix - Race - WEBDL-2160p";
+        let race_mkv = format!("{race}.mkv");
+        let race_nfo = format!("{race}.nfo");
+        write_files(
+            dir.path(),
+            &[
+                (race_mkv.as_str(), b"fake"),
+                (race_nfo.as_str(), SPORTARR_RACE_NFO),
+                (
+                    "Formula 1/tvshow.nfo",
+                    b"<tvshow><title>Formula 1</title><plot>The pinnacle of motorsport.</plot>\
+                      <genre>Motorsport</genre><studio>FIA</studio>\
+                      <uniqueid type=\"sportarr\">lg-1</uniqueid>\
+                      <namedseason number=\"2026\">2026 World Championship</namedseason></tvshow>",
+                ),
+                // Numbered only by its NFO.
+                ("Formula 1/Season 2026/Singapore Sprint.mkv", b"fake"),
+                (
+                    "Formula 1/Season 2026/Singapore Sprint.nfo",
+                    b"<episodedetails><title>Sprint</title><season>2026</season><episode>89</episode></episodedetails>",
+                ),
+                // Numbered by nothing, so dropped.
+                ("Formula 1/Season 2026/Paddock Walk.mkv", b"fake"),
+            ],
+        );
+        let (ctx, _guard, _tmdb, addon, _db_addon) =
+            scan_local(dir.path(), "episode", serde_json::json!({})).await;
+
+        let items = catalog_items(&addon, &ctx).await;
+        assert_eq!(items.len(), 1);
+        let series = &items[0];
+        assert_eq!(series.title, "Formula 1");
+        assert_eq!(
+            series
+                .description
+                .as_deref(),
+            Some("The pinnacle of motorsport.")
+        );
+        let rel_kinds: Vec<(db::MediaKind, &str)> = series
+            .relations
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|(_, m)| {
+                (
+                    m.kind
+                        .clone(),
+                    m.title
+                        .as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rel_kinds,
+            vec![
+                (db::MediaKind::Genre, "Motorsport"),
+                (db::MediaKind::Studio, "FIA")
+            ]
+        );
+
+        let series_patch = addon
+            .meta_fetch(series, &ctx, &Default::default())
+            .await
+            .unwrap()
+            .expect("series meta");
+        assert_eq!(
+            series_patch
+                .description
+                .as_deref(),
+            Some("The pinnacle of motorsport.")
+        );
+
+        let seasons = addon
+            .get_children(series, &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seasons.len(), 1);
+        assert_eq!(seasons[0].title, "2026 World Championship");
+
+        let episodes = addon
+            .get_children(&seasons[0], &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        let numbered: Vec<(Option<i64>, &str)> = episodes
+            .iter()
+            .map(|e| {
+                (
+                    e.idx,
+                    e.title
+                        .as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            numbered,
+            vec![
+                (Some(89), "Sprint"),
+                (Some(91), "Singapore Grand Prix - Race")
+            ]
+        );
+        let race_episode = &episodes[1];
+        assert_eq!(
+            race_episode
+                .description
+                .as_deref(),
+            Some("Round 18 at Marina Bay.")
+        );
+        assert_eq!(
+            race_episode.released_at,
+            chrono::NaiveDate::from_ymd_opt(2026, 10, 4)
+                .and_then(|d| d.and_hms_opt(0, 0, 0))
+        );
+
+        assert!(MetaAddon::supports(&addon, race_episode).await);
+        let episode_patch = addon
+            .meta_fetch(race_episode, &ctx, &Default::default())
+            .await
+            .unwrap()
+            .expect("episode meta");
+        assert_eq!(episode_patch.title, "Singapore Grand Prix - Race");
+        let season_patch = addon
+            .meta_fetch(&seasons[0], &ctx, &Default::default())
+            .await
+            .unwrap()
+            .expect("season meta");
+        assert_eq!(season_patch.title, "2026 World Championship");
+    }
+
+    #[tokio::test]
+    async fn sidecar_formats_read_only_their_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Show/Season 1/Show - S01E01.mkv", b"fake"),
+                (
+                    "Show/Season 1/season.nfo",
+                    b"<season><title>The Beginning</title><seasonnumber>1</seasonnumber></season>",
+                ),
+                ("Show/Season 1/Bonus.mkv", b"fake"),
+                ("Show/.plexmatch", b"Title: Plex Show\nep: S01E02: Season 1/Bonus.mkv\n"),
+            ],
+        );
+
+        let (ctx, _guard, _tmdb, addon, _) = scan_local(
+            dir.path(),
+            "episode",
+            serde_json::json!({ "sidecar_format": "jellyfin" }),
+        )
+        .await;
+        let series = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        assert_eq!(series.title, "Show");
+        let seasons = addon
+            .get_children(&series, &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seasons[0].title, "The Beginning");
+        let episodes = addon
+            .get_children(&seasons[0], &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(episodes.len(), 1, "Jellyfin does not read .plexmatch");
+
+        let (ctx, _guard, _tmdb, addon, _) = scan_local(
+            dir.path(),
+            "episode",
+            serde_json::json!({ "sidecar_format": "plex" }),
+        )
+        .await;
+        let series = catalog_items(&addon, &ctx)
+            .await
+            .remove(0);
+        assert_eq!(series.title, "Plex Show");
+        let seasons = addon
+            .get_children(&series, &ctx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            seasons[0].title, "Season 1",
+            "Plex does not read season.nfo"
+        );
+        let episodes: Vec<Option<i64>> = addon
+            .get_children(&seasons[0], &ctx)
+            .await
+            .unwrap()
+            .unwrap()
+            .iter()
+            .map(|e| e.idx)
+            .collect();
+        assert_eq!(episodes, vec![Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn an_nfo_id_moves_an_unmatched_movie_to_its_imdb_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_files(
+            dir.path(),
+            &[
+                ("Films/Some Film.mkv", b"fake"),
+                ("Films/Some Film.en.srt", b"sub"),
+                (
+                    "Films/Some Film.nfo",
+                    b"<movie><title>Some Film</title></movie>",
+                ),
+                ("Films/Other Film.mkv", b"fake"),
+            ],
+        );
+        let (ctx, _guard, _tmdb, addon, db_addon) =
+            scan_local(dir.path(), "movie", serde_json::json!({})).await;
+        let movie = catalog_items(&addon, &ctx)
+            .await
+            .into_iter()
+            .find(|m| m.title == "Some Film")
+            .unwrap();
+        assert!(is_local_only(&movie));
+
+        // An id added later is used even though the TMDB lookup is throttled.
+        write_files(
+            dir.path(),
+            &[(
+                "Films/Some Film.nfo",
+                b"<movie><title>Some Film</title><imdbid>tt0111161</imdbid></movie>",
+            )],
+        );
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        let items = catalog_items(&addon, &ctx).await;
+        let matched = items
+            .iter()
+            .find(|m| m.title == "Some Film")
+            .unwrap();
+        assert_eq!(
+            matched
+                .external_ids
+                .imdb
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("tt0111161")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|m| m.title == "Other Film" && is_local_only(m)),
+            "a movie without ids stays local"
+        );
+        let subs = addon
+            .subtitle_fetch(matched, &SubtitleQuery::default(), &ctx.db)
+            .await
+            .unwrap();
+        assert_eq!(subs.len(), 1, "the subtitle moves with its movie");
+    }
+
+    #[tokio::test]
+    async fn local_metadata_adds_the_meta_resource() {
+        let dir = tempfile::tempdir().unwrap();
+        let tmdb = tmdb_finding_nothing();
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        for (cfg, expected) in [(serde_json::json!({}), false), (fallback_cfg(), true)]
+        {
+            let (addon, _) =
+                make_local_addon_with(&ctx, dir.path(), "movie", cfg).await;
+            let (resources, _) = addon
+                .available_info()
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                resources
+                    .iter()
+                    .any(|r| r.name == ResourceType::Meta),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
