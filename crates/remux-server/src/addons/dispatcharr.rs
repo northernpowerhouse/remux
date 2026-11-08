@@ -532,8 +532,9 @@ pub(crate) fn channel_to_media(
     ch: &DispatcharrChannel,
     addon_id: Uuid,
     source_id: &str,
+    base_url: &str,
 ) -> db::Media {
-    db::Media {
+    let mut media = db::Media {
         id: Uuid::new_v5(&addon_id, format!("channel:{}", ch.id).as_bytes()),
         title: ch
             .name
@@ -548,7 +549,19 @@ pub(crate) fn channel_to_media(
         },
         enabled: true,
         ..Default::default()
+    };
+    // Dispatcharr serves logos without auth. Remux fetches images server-side
+    // and proxies them, so an address only Remux can reach is fine.
+    if let Some(logo_id) = ch.logo_id {
+        media.set_image(
+            db::ImageKind::Primary,
+            format!(
+                "{}/api/channels/logos/{logo_id}/cache/",
+                base_url.trim_end_matches('/')
+            ),
+        );
     }
+    media
 }
 
 pub(crate) fn stream_to_media(
@@ -880,7 +893,7 @@ impl CatalogAddon for DispatcharrAddon {
         let channels = fetch_channels(&client, &self.base_url, &self.api_key).await?;
         let items: Vec<db::Media> = channels
             .iter()
-            .map(|ch| channel_to_media(ch, addon_id, &source_id))
+            .map(|ch| channel_to_media(ch, addon_id, &source_id, &self.base_url))
             .collect();
 
         Ok(Some(Box::pin(futures::stream::iter(items))))
@@ -1189,7 +1202,7 @@ mod tests {
             "id": 42, "uuid": "u-42", "name": "BBC One", "channel_number": 7.5,
             "tvg_id": "BBC1.uk",
         }));
-        let m = channel_to_media(&ch, ADDON, "src");
+        let m = channel_to_media(&ch, ADDON, "src", "http://d");
         assert_eq!(m.id, Uuid::new_v5(&ADDON, b"channel:42"));
         assert_eq!(m.title, "BBC One");
         assert_eq!(m.kind, db::MediaKind::TvChannel);
@@ -1207,9 +1220,31 @@ mod tests {
         // The guide is matched through `epg_data_id`, not this copy.
         assert_eq!(m.tvg_id, None);
         assert!(m.enabled);
-        assert_ne!(m.id, channel_to_media(&ch, Uuid::from_u128(1), "s").id);
+        assert_ne!(
+            m.id,
+            channel_to_media(&ch, Uuid::from_u128(1), "s", "http://d").id
+        );
         let bare = channel(json!({ "id": 2, "uuid": "u", "name": "B" }));
-        assert_eq!(channel_to_media(&bare, ADDON, "s").channel_number, None);
+        let bare_media = channel_to_media(&bare, ADDON, "s", "http://d");
+        assert_eq!(bare_media.channel_number, None);
+        assert!(
+            bare_media
+                .images
+                .primary
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn channel_to_media_sets_logo_from_dispatcharr() {
+        let ch = channel(json!({ "id": 3, "uuid": "u", "name": "C", "logo_id": 24 }));
+        let m = channel_to_media(&ch, ADDON, "s", "http://dispatcharr:9191/");
+        assert_eq!(
+            m.images
+                .primary[0]
+                .path,
+            "http://dispatcharr:9191/api/channels/logos/24/cache/"
+        );
     }
 
     #[test]
@@ -1271,7 +1306,10 @@ mod tests {
         );
         // The FK only holds if both sides derive the channel id the same way.
         let ch = channel(json!({ "id": 42, "uuid": "u", "name": "BBC One" }));
-        assert_eq!(m.parent_id, Some(channel_to_media(&ch, ADDON, "src").id));
+        assert_eq!(
+            m.parent_id,
+            Some(channel_to_media(&ch, ADDON, "src", "http://d").id)
+        );
 
         // Unnamed, and ending before it starts.
         let odd = recording(json!({

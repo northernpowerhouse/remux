@@ -376,7 +376,7 @@ impl Task for RefreshDispatcharrLiveTvTask {
                 .to_string();
             let channel_media: Vec<db::Media> = channels
                 .iter()
-                .map(|ch| channel_to_media(ch, addon_id, &source_id))
+                .map(|ch| channel_to_media(ch, addon_id, &source_id, &base_url))
                 .collect();
             // Before the versions and recordings below, which reference these
             // rows by `parent_id`.
@@ -812,7 +812,7 @@ mod tests {
                 "id": 42, "uuid": "u", "name": "BBC One"
             }))
             .unwrap();
-        let mut channel = channel_to_media(&ch, addon, "src");
+        let mut channel = channel_to_media(&ch, addon, "src", "http://d");
         let yesterday = chrono::Utc::now().naive_utc() - chrono::Duration::days(2);
         channel.streams_refreshed_at = Some(yesterday);
         db::Media::upsert(&db, &[channel.clone()])
@@ -880,7 +880,7 @@ mod tests {
                 "id": 42, "uuid": "u", "name": "BBC One"
             }))
             .unwrap();
-        let channel = channel_to_media(&ch, addon, "src");
+        let channel = channel_to_media(&ch, addon, "src", "http://d");
         db::Media::upsert(db, &[channel.clone()])
             .await
             .unwrap();
@@ -977,7 +977,7 @@ mod tests {
                     "id": id, "uuid": "u", "name": format!("Channel {id}")
                 }))
                 .unwrap();
-            channel_to_media(&ch, addon, source)
+            channel_to_media(&ch, addon, source, "http://d")
         };
 
         let kept = make(42, addon, &source);

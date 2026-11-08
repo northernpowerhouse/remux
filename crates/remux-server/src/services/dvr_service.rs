@@ -930,7 +930,14 @@ impl DvrService {
         );
         let missing: Vec<db::Media> = channels
             .iter()
-            .map(|ch| dispatcharr::channel_to_media(ch, cfg.addon_id, &source_id))
+            .map(|ch| {
+                dispatcharr::channel_to_media(
+                    ch,
+                    cfg.addon_id,
+                    &source_id,
+                    &cfg.base_url,
+                )
+            })
             .filter(|m| wanted.contains(&m.id) && !present.contains(&m.id))
             .collect();
         present.extend(
@@ -1940,7 +1947,12 @@ mod tests {
                 .unwrap();
         db::Media::upsert(
             &ctx.db,
-            &vec![dispatcharr::channel_to_media(&ch, addon, &source(addon))],
+            &vec![dispatcharr::channel_to_media(
+                &ch,
+                addon,
+                &source(addon),
+                "http://d",
+            )],
         )
         .await
         .unwrap();
@@ -2083,7 +2095,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             channel_uuid_of(ADDON, 42),
-            dispatcharr::channel_to_media(&ch, ADDON, "s").id
+            dispatcharr::channel_to_media(&ch, ADDON, "s", "http://d").id
         );
     }
 
