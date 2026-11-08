@@ -966,9 +966,19 @@ pub async fn livetv_live_recording_stream(
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
 
-    if file_url.contains("/hls/") || file_url.ends_with(".m3u8") {
+    // A recording whose MKV is missing (still being written, or a failed
+    // HLS→MKV remux) keeps a `/file/` URL that Dispatcharr redirects to its
+    // HLS playlist. That playlist needs the same rewrite, or its segment URIs
+    // reach the client pointing at Dispatcharr without the API key.
+    let playlist_url = if is_hls_url(file_url) {
+        Some(url.clone())
+    } else {
+        hls_playlist_behind(&url, &cfg.api_key, &cfg.base_url).await
+    };
+
+    if let Some(playlist_url) = playlist_url {
         let resp = crate::addons::dispatcharr::CLIENT
-            .get(&url)
+            .get(&playlist_url)
             .header("X-API-Key", &cfg.api_key)
             .send()
             .await
@@ -1007,6 +1017,57 @@ pub async fn livetv_live_recording_stream(
         .serve(&state, &headers)
         .await?
         .into_response())
+}
+
+fn is_hls_url(url: &str) -> bool {
+    url.contains("/hls/") || url.ends_with(".m3u8")
+}
+
+/// Follows no redirects, so a `/file/` request can be checked without
+/// starting to stream the MKV behind it.
+static NO_REDIRECT_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent("remux-server/1.0")
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("failed to build Dispatcharr no-redirect client")
+    });
+
+/// The HLS playlist Dispatcharr redirects a recording's file `url` to, if it
+/// does. Only a redirect to an HLS URL on the same instance counts; anything
+/// else, including a failed request, means the file is served as it is.
+async fn hls_playlist_behind(
+    url: &str,
+    api_key: &str,
+    base_url: &str,
+) -> Option<String> {
+    let resp = NO_REDIRECT_CLIENT
+        .head(url)
+        .header("X-API-Key", api_key)
+        .send()
+        .await
+        .ok()?;
+    if !resp
+        .status()
+        .is_redirection()
+    {
+        return None;
+    }
+    let location = resp
+        .headers()
+        .get(http::header::LOCATION)?
+        .to_str()
+        .ok()?;
+    let location = url::Url::parse(url)
+        .ok()?
+        .join(location)
+        .ok()?
+        .to_string();
+    let location = recording_url(base_url, &location)?;
+    is_hls_url(&location).then_some(location)
 }
 
 /// The URL a recording's `file_url` names on the instance at `base_url`, or
@@ -2107,5 +2168,90 @@ mod tests {
         )
         .await;
         assert!(started.elapsed() < StdDuration::from_secs(3));
+    }
+
+    const FILE: &str = "/api/channels/recordings/2/file/";
+    const PLAYLIST: &str = "/api/channels/recordings/2/hls/index.m3u8";
+
+    #[tokio::test]
+    async fn a_file_url_redirected_to_hls_resolves_to_the_playlist() {
+        let server = httpmock::MockServer::start();
+        let head = server.mock(|when, then| {
+            when.method(httpmock::Method::HEAD)
+                .path(FILE)
+                .header("X-API-Key", "k");
+            then.status(302)
+                .header("Location", server.url(PLAYLIST));
+        });
+        let base = server.base_url();
+        assert_eq!(
+            hls_playlist_behind(&server.url(FILE), "k", &base).await,
+            Some(server.url(PLAYLIST))
+        );
+        head.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn a_relative_redirect_is_resolved_against_the_file_url() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::HEAD)
+                .path(FILE);
+            then.status(302)
+                .header("Location", "../hls/index.m3u8");
+        });
+        assert_eq!(
+            hls_playlist_behind(&server.url(FILE), "k", &server.base_url()).await,
+            Some(server.url(PLAYLIST))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_exists_is_not_a_playlist() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::HEAD)
+                .path(FILE);
+            then.status(200)
+                .header("Content-Type", "video/x-matroska");
+        });
+        assert_eq!(
+            hls_playlist_behind(&server.url(FILE), "k", &server.base_url()).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_off_the_instance_or_away_from_hls_is_ignored() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::HEAD)
+                .path(FILE);
+            then.status(302)
+                .header(
+                    "Location",
+                    "http://elsewhere.invalid/api/channels/recordings/2/hls/index.m3u8",
+                );
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::HEAD)
+                .path("/api/channels/recordings/3/file/");
+            then.status(302)
+                .header("Location", "/api/channels/recordings/3/download/");
+        });
+        let base = server.base_url();
+        assert_eq!(
+            hls_playlist_behind(&server.url(FILE), "k", &base).await,
+            None
+        );
+        assert_eq!(
+            hls_playlist_behind(
+                &server.url("/api/channels/recordings/3/file/"),
+                "k",
+                &base
+            )
+            .await,
+            None
+        );
     }
 }
